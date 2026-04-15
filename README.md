@@ -15,8 +15,8 @@ docker compose up -d --build
 ```
 
 После запуска:
-- `http://localhost:8080/` — методист
-- `http://localhost:8080/student/template.html` — ученик
+- `http://localhost:8090/` — методист
+- `http://localhost:8090/student/template.html` — ученик
 
 ## Развертывание на сервере в `/home/projects/`
 
@@ -35,7 +35,7 @@ docker compose up -d --build
 docker compose ps
 ```
 
-Приложение будет слушать `127.0.0.1:8080` (через mapping `8080:80`).
+Приложение будет слушать `127.0.0.1:8090` (через mapping `8090:80`).
 
 ### 3) Подключение домена через nginx на сервере
 Скопируйте конфиг:

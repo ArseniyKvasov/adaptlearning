@@ -6,4 +6,4 @@ services:
     container_name: adaptive-learning-prototype
     restart: unless-stopped
     ports:
-      - "8080:80"
+      - "8090:80"
