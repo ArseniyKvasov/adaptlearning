@@ -362,7 +362,7 @@ function setGenerateButtonState() {
     return;
   }
   generateBtn.textContent = 'Обработать запись';
-  generateBtn.disabled = false;
+  generateBtn.disabled = !fileUploaded;
   generateBtn.classList.remove('processing');
 }
 
