@@ -1,0 +1,9 @@
+services:
+  adaptive-learning-prototype:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: adaptive-learning-prototype
+    restart: unless-stopped
+    ports:
+      - "8080:80"
