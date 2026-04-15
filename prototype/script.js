@@ -45,6 +45,7 @@ let generationHistory = [];
 let tasksById = {};
 let activeTaskId = null;
 let processingTaskId = null;
+let hadVisibleHistoryOnInit = false;
 
 let fileUploaded = false;
 let uploadedFileName = '';
@@ -992,7 +993,7 @@ window.insertFormulaBlock = function insertFormulaBlock() {
 function renderHistory() {
   const currentPassword = ensureUserPasswordCookie();
   const visibleHistory = currentPassword ? generationHistory.filter((item) => (item.owner_password || '') === currentPassword) : [];
-  const shouldShowHistory = visibleHistory.length > 0;
+  const shouldShowHistory = visibleHistory.length > 1 || (hadVisibleHistoryOnInit && visibleHistory.length > 0);
   updateHistoryVisibility(shouldShowHistory);
 
   if (!visibleHistory.length) {
@@ -1657,6 +1658,10 @@ function hydrateState() {
     });
     if (migrated) persistHistory();
   }
+
+  hadVisibleHistoryOnInit = cookiePassword
+    ? generationHistory.some((item) => (item.owner_password || '') === cookiePassword)
+    : false;
 
   if (generationHistory.length) {
     generationHistory = generationHistory.map((item) => ({ ...item, is_active: false }));
