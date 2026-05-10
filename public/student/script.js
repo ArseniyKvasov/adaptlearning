@@ -433,7 +433,7 @@ function syncSummarySelection() {
     item.classList.toggle('active', isActive);
   });
   summaryContainer.querySelectorAll('.summary-section').forEach((section) => {
-    const isActive = normalizeTextBreaks(section.getAttribute('data-subtopic') || '').trim().toLowerCase() === active;
+    const isActive = active !== '' && normalizeTextBreaks(section.getAttribute('data-subtopic') || '').trim().toLowerCase() === active;
     section.classList.toggle('is-active', isActive);
   });
 }
