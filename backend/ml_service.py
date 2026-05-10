@@ -363,13 +363,14 @@ class MLServiceClient:
 
     async def make_lesson_summary(self, mini_summaries: list[dict[str, Any]], topic_hint: str = "") -> list[dict[str, Any]]:
         last_error: Exception = MLServiceError("Lesson summary failed", "Не удалось сгенерировать конспект.")
-        for attempt in range(1, 3):
+        for attempt in range(1, 4):
             try:
                 return await self._make_lesson_summary_once(mini_summaries, topic_hint)
             except MLServiceError as e:
                 last_error = e
                 print(f"[make_lesson_summary] attempt {attempt} failed, retrying...")
-                await asyncio.sleep(1.5 * attempt)
+                if attempt < 3:
+                    await asyncio.sleep(1.5 * attempt)
         raise last_error
 
     async def make_quiz(

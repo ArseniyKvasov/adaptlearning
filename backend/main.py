@@ -1185,22 +1185,7 @@ async def build_summary_and_quiz(
     summary_groups = transcript_to_summary_groups([chunk["transcript_chunk"] for chunk in transcript_chunks])
     log_summary_payload(summary_groups, "build_summary_and_quiz")
     mini_summaries = await asyncio.gather(*(ml_client.make_mini_summary(chunk) for chunk in summary_groups))
-
-    last_error: Exception = MLServiceError("Lesson summary failed", "Не удалось сгенерировать конспект.")
-    summary: list[dict[str, Any]] = []
-    for attempt in range(1, 4):
-        try:
-            summary = await ml_client.make_lesson_summary(list(mini_summaries))
-            if summary:
-                break
-        except MLServiceError as e:
-            last_error = e
-            print(f"[build_summary_and_quiz] lesson summary attempt {attempt} failed, retrying...")
-            if attempt < 3:
-                await asyncio.sleep(1.5 * attempt)
-    if not summary:
-        raise last_error
-
+    summary = await ml_client.make_lesson_summary(list(mini_summaries))
     log_final_summary(summary, "build_summary_and_quiz")
     quiz = shuffle_quiz_options(await ml_client.make_quiz(summary))
     transcript: list[dict[str, Any]] = []
@@ -1231,21 +1216,7 @@ async def run_ml_retry_pipeline(generation_id: str) -> None:
                 )
             log_summary_payload(summary_groups, "run_ml_retry_pipeline")
             mini_summaries = await asyncio.gather(*(ml_client.make_mini_summary(chunk) for chunk in summary_groups))
-
-            last_error: Exception = MLServiceError("Lesson summary failed", "Не удалось сгенерировать конспект.")
-            for attempt in range(1, 4):
-                try:
-                    summary = await ml_client.make_lesson_summary(mini_summaries)
-                    if summary:
-                        break
-                except MLServiceError as e:
-                    last_error = e
-                    print(f"[run_ml_retry_pipeline] lesson summary attempt {attempt} failed, retrying...")
-                    if attempt < 3:
-                        await asyncio.sleep(1.5 * attempt)
-            if not summary:
-                raise last_error
-
+            summary = await ml_client.make_lesson_summary(mini_summaries)
             log_final_summary(summary, "run_ml_retry_pipeline")
             update_generation(generation_id, {"summary": summary})
 
@@ -1282,22 +1253,7 @@ async def finalize_generation_from_transcript(generation_id: str, transcript: li
 
         log_summary_payload(summary_groups, "finalize_generation_from_transcript")
         mini_summaries = await asyncio.gather(*(ml_client.make_mini_summary(chunk) for chunk in summary_groups))
-
-        last_error: Exception = MLServiceError("Lesson summary failed", "Не удалось сгенерировать конспект.")
-        summary: list[dict[str, Any]] = []
-        for attempt in range(1, 4):
-            try:
-                summary = await ml_client.make_lesson_summary(mini_summaries)
-                if summary:
-                    break
-            except MLServiceError as e:
-                last_error = e
-                print(f"[finalize_generation_from_transcript] lesson summary attempt {attempt} failed, retrying...")
-                if attempt < 3:
-                    await asyncio.sleep(1.5 * attempt)
-        if not summary:
-            raise last_error
-
+        summary = await ml_client.make_lesson_summary(mini_summaries)
         log_final_summary(summary, "finalize_generation_from_transcript")
         quiz = shuffle_quiz_options(await ml_client.make_quiz(summary))
 
