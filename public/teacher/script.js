@@ -683,7 +683,7 @@ function applyTeacherSelectedAnswer(gen, answerIdx) {
   if (!isCorrect) {
     const feedback = root.querySelector('[data-quiz-feedback]');
     if (feedback) feedback.hidden = false;
-    const nextBtn = root.querySelector('[data-next-question-btn]');
+    const nextBtn = root.querySelector('.next-question-btn');
     if (nextBtn) nextBtn.hidden = false;
   } else {
     setTimeout(() => nextQuestion(), 450);
@@ -923,47 +923,31 @@ function renderQuiz(gen) {
 
   let html = `<div class="quiz-item" data-question-idx="${ui.quizIndex}"><div class="quiz-question">${ui.quizIndex + 1}. ${markdownInlineToHtmlQuiz(q.question_text || '')}</div>`;
 
-  if (!answered) {
-    if (open) {
+  if (open) {
+    if (!answered) {
       html += '<div class="open-ended-area"><textarea id="openAnswer" class="open-ended-input" rows="4" placeholder="Введите ваш ответ..."></textarea><button class="check-answer-btn" onclick="checkOpenEndedAnswer()">Проверить ответ</button></div>';
     } else {
-      for (let i = 0; i < q.options.length; i++) {
-        html += `<div class="quiz-option" data-opt-index="${i}"><label>${markdownInlineToHtmlQuiz(q.options[i] || '')}</label></div>`;
-      }
-      html += `
-        <div class="quiz-feedback" data-quiz-feedback hidden>
-          <div class="explanation-box"><strong>Объяснение:</strong><br>${markdownInlineToHtmlQuiz(q.explanation || '')}</div>
-          <div class="next-btn-container"><button class="next-question-btn" data-next-question-btn type="button" onclick="nextQuestion()">Далее</button></div>
-        </div>
-      `;
-    }
-  } else {
-    if (open) {
       html += `<div class="open-ended-area"><textarea class="open-ended-input" rows="4" disabled>${escapeHtml(ui.quizAnswers[ui.quizIndex].answer || '')}</textarea></div>`;
       html += `<div class="explanation-box"><strong>Эталонный ответ:</strong><br>${markdownInlineToHtmlQuiz(q.correct_answer || '')}</div>`;
-      html += '<div class="next-btn-container"><button class="next-question-btn" onclick="nextQuestion()">Далее</button></div>';
-    } else {
-      const user = ui.quizAnswers[ui.quizIndex];
-      const correct = user.answer === q.correct_answer;
-      for (let i = 0; i < q.options.length; i++) {
-        let cls = '';
-        if (i === q.correct_answer) cls = 'correct-highlight';
-        if (i === user.answer && i !== q.correct_answer) cls = 'wrong-highlight';
-        html += `<div class="quiz-option ${cls}"><label>${markdownInlineToHtmlQuiz(q.options[i] || '')}</label></div>`;
-      }
-      if (!correct) {
-        html += `<div class="explanation-box"><strong>Объяснение:</strong><br>${markdownInlineToHtmlQuiz(q.explanation || '')}</div>`;
-        html += '<div class="next-btn-container"><button class="next-question-btn" onclick="nextQuestion()">Далее</button></div>';
-      } else {
-        setTimeout(() => nextQuestion(), 450);
-      }
+      html += '<div class="next-btn-container"><button class="next-question-btn" type="button">Далее</button></div>';
     }
+  } else {
+    const options = Array.isArray(q.options) ? q.options : [];
+    for (let i = 0; i < options.length; i++) {
+      html += `<div class="quiz-option" data-opt-index="${i}"><label>${markdownInlineToHtmlQuiz(options[i] || '')}</label></div>`;
+    }
+    html += `
+      <div class="quiz-feedback" data-quiz-feedback hidden>
+        <div class="explanation-box"><strong>Объяснение:</strong><br>${markdownInlineToHtmlQuiz(q.explanation || '')}</div>
+        <div class="next-btn-container"><button class="next-question-btn" type="button">Далее</button></div>
+      </div>
+    `;
   }
 
   html += '</div>';
   quizContainer.innerHTML = html;
 
-  if (!answered && !open) {
+  if (!open) {
     quizContainer.querySelectorAll('.quiz-option').forEach((node) => {
       node.addEventListener('click', () => {
         const idx = parseInt(node.getAttribute('data-opt-index'), 10);
@@ -972,10 +956,16 @@ function renderQuiz(gen) {
     });
   }
 
-  const nextBtn = quizContainer.querySelector('[data-next-question-btn]');
+  const nextBtn = quizContainer.querySelector('.next-question-btn');
   if (nextBtn) {
-    nextBtn.onclick = nextQuestion;
-    nextBtn.addEventListener('click', nextQuestion);
+    nextBtn.onclick = function() {
+      if (gen.ui.quizIndex >= gen.quiz.length) return;
+      nextQuestion();
+    };
+  }
+
+  if (!open && answered) {
+    applyTeacherSelectedAnswer(gen, ui.quizAnswers[ui.quizIndex].answer);
   }
 
   setTimeout(() => renderMathInContainer(quizContainer), 30);
