@@ -332,9 +332,6 @@ function applySelectedAnswer(answerIdx) {
     if (nextBtn) nextBtn.hidden = false;
   }
 
-  if (isCorrect) {
-    setTimeout(() => nextQuestion(), 450);
-  }
 }
 
 function renderQuiz() {
@@ -408,15 +405,6 @@ function renderQuiz() {
     if (!correct) {
       html += `<div class="explanation-box"><strong>Объяснение:</strong><br>${markdownInlineToHtmlQuiz(q.explanation || '')}</div>`;
       html += '<div class="next-btn-container"><button class="next-question-btn" id="nextQuestionBtn">Далее</button></div>';
-    } else {
-      if (quizState.index + 1 < quizData.length) {
-        setTimeout(() => nextQuestion(), 450);
-      } else {
-        setTimeout(() => {
-          quizState.index = quizData.length;
-          renderQuiz();
-        }, 450);
-      }
     }
   }
 
@@ -438,7 +426,6 @@ function renderQuiz() {
   const nextBtn = quizContainer.querySelector('[data-next-question-btn]');
   if (nextBtn) {
     nextBtn.onclick = nextQuestion;
-    nextBtn.addEventListener('click', nextQuestion);
   }
 
   setTimeout(() => renderMathInContainer(quizContainer), 30);
