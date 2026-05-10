@@ -1294,7 +1294,7 @@ body.drawer-open {
 }
 
 .code-block {
-  background: #0d1117;
+  background: #f6f8fa;
   border-radius: 12px;
   padding: 1rem;
   margin: 0.75rem 0;
@@ -1302,7 +1302,7 @@ body.drawer-open {
   font-family: 'SF Mono', 'Fira Code', 'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace;
   font-size: 0.82rem;
   line-height: 1.55;
-  border: 1px solid #30363d;
+  border: 1px solid #d0d7de;
 }
 
 .code-block code {
@@ -1311,7 +1311,7 @@ body.drawer-open {
   font-family: inherit;
   font-size: inherit;
   line-height: inherit;
-  color: #c9d1d9;
+  color: #24292f;
   white-space: pre;
 }
 
