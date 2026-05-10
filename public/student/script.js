@@ -600,9 +600,14 @@ window.checkOpenEndedAnswer = function checkOpenEndedAnswer() {
 };
 
 window.nextQuestion = function nextQuestion() {
-  if (quizState.index >= quizData.length) return;
+  console.log('[nextQuestion] called, current index:', quizState.index, 'total:', quizData.length);
+  if (quizState.index >= quizData.length) {
+    console.log('[nextQuestion] already at end, aborting');
+    return;
+  }
   if (quizState.index + 1 < quizData.length) quizState.index += 1;
   else quizState.index = quizData.length;
+  console.log('[nextQuestion] new index:', quizState.index);
   saveQuizProgress();
   renderQuiz();
 };
