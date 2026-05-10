@@ -335,6 +335,14 @@ function applySelectedAnswer(answerIdx) {
   }
 }
 
+function bindNextButton() {
+  const nextBtn = quizContainer.querySelector('[data-next-question-btn]');
+  if (!nextBtn) return;
+  nextBtn.addEventListener('click', () => {
+    nextQuestion();
+  }, { once: true });
+}
+
 function renderQuiz() {
   if (!quizData.length) {
     quizContainer.innerHTML = '<div class="status-message">Тест недоступен</div>';
@@ -424,10 +432,7 @@ function renderQuiz() {
   const checkBtn = document.getElementById('checkAnswerBtn');
   if (checkBtn) checkBtn.addEventListener('click', checkOpenEndedAnswer);
 
-  const nextBtn = quizContainer.querySelector('[data-next-question-btn]');
-  if (nextBtn) {
-    nextBtn.onclick = nextQuestion;
-  }
+  bindNextButton();
 
   setTimeout(() => renderMathInContainer(quizContainer), 30);
 }
@@ -607,6 +612,7 @@ window.checkOpenEndedAnswer = function checkOpenEndedAnswer() {
 };
 
 window.nextQuestion = function nextQuestion() {
+  if (quizState.index >= quizData.length) return;
   if (quizState.index + 1 < quizData.length) quizState.index += 1;
   else quizState.index = quizData.length;
   saveQuizProgress();
