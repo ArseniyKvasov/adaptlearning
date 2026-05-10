@@ -381,7 +381,7 @@ function renderQuiz() {
   } else if (open) {
     html += `<div class="open-ended-area"><textarea class="open-ended-input" rows="4" disabled>${escapeHtml(quizState.answers[qid].answer || '')}</textarea></div>`;
     html += `<div class="explanation-box"><strong>Эталонный ответ:</strong><br>${markdownInlineToHtmlQuiz(q.correct_answer || '')}</div>`;
-    html += '<div class="next-btn-container"><button class="next-question-btn" id="nextQuestionBtn">Далее</button></div>';
+    html += '<div class="next-btn-container"><button class="next-question-btn" id="nextQuestionBtn" data-next-question-btn type="button">Далее</button></div>';
   } else {
     const user = quizState.answers[qid];
     const correct = user.answer === q.correct_answer;
@@ -512,6 +512,51 @@ async function submitQuiz() {
   }
 }
 
+function getStorageKey() {
+  return `quiz_progress_${generationId}`;
+}
+
+function saveQuizProgress() {
+  if (!generationId) return;
+  const payload = {
+    index: quizState.index,
+    answers: quizState.answers,
+    checkStatus: quizState.checkStatus,
+    checkResult: quizState.checkResult,
+    reviewMode: quizState.reviewMode
+  };
+  try {
+    localStorage.setItem(getStorageKey(), JSON.stringify(payload));
+  } catch (_e) {
+    // ignore
+  }
+}
+
+function loadQuizProgress() {
+  if (!generationId) return;
+  try {
+    const raw = localStorage.getItem(getStorageKey());
+    if (!raw) return;
+    const data = JSON.parse(raw);
+    if (typeof data.index === 'number') quizState.index = data.index;
+    if (data.answers) quizState.answers = data.answers;
+    if (data.checkStatus) quizState.checkStatus = data.checkStatus;
+    if (data.checkResult) quizState.checkResult = data.checkResult;
+    if (typeof data.reviewMode === 'boolean') quizState.reviewMode = data.reviewMode;
+  } catch (_e) {
+    // ignore
+  }
+}
+
+function clearQuizProgress() {
+  if (!generationId) return;
+  try {
+    localStorage.removeItem(getStorageKey());
+  } catch (_e) {
+    // ignore
+  }
+}
+
 function initQuizState() {
   quizState.index = 0;
   quizState.answers = {};
@@ -543,6 +588,7 @@ window.selectAnswer = function selectAnswer(answerIdx) {
   const qid = String(q.question_id || quizState.index + 1);
   if (quizState.answers[qid] && quizState.answers[qid].answered) return;
   quizState.answers[qid] = { answer: answerIdx, answered: true };
+  saveQuizProgress();
   applySelectedAnswer(answerIdx);
 };
 
@@ -555,12 +601,14 @@ window.checkOpenEndedAnswer = function checkOpenEndedAnswer() {
   if (!val) return;
   const qid = String(q.question_id || quizState.index + 1);
   quizState.answers[qid] = { answer: val, answered: true };
+  saveQuizProgress();
   renderQuiz();
 };
 
 window.nextQuestion = function nextQuestion() {
   if (quizState.index + 1 < quizData.length) quizState.index += 1;
   else quizState.index = quizData.length;
+  saveQuizProgress();
   renderQuiz();
 };
 
@@ -588,6 +636,9 @@ window.nextQuestion = function nextQuestion() {
     quizState.reviewMode = true;
     quizState.checkStatus = 'done';
     quizState.checkResult = data.attempt;
+    clearQuizProgress();
+  } else {
+    loadQuizProgress();
   }
   bindEvents();
   renderSummary();
