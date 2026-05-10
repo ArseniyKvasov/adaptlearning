@@ -330,8 +330,9 @@ function applySelectedAnswer(answerIdx) {
     if (feedback) feedback.hidden = false;
     const nextBtn = root.querySelector('[data-next-question-btn]');
     if (nextBtn) nextBtn.hidden = false;
+  } else {
+    setTimeout(() => nextQuestion(), 450);
   }
-
 }
 
 function renderQuiz() {
@@ -384,7 +385,7 @@ function renderQuiz() {
       html += `
         <div class="quiz-feedback" data-quiz-feedback hidden>
           <div class="explanation-box"><strong>Объяснение:</strong><br>${markdownInlineToHtmlQuiz(q.explanation || '')}</div>
-          <div class="next-btn-container"><button class="next-question-btn" data-next-question-btn type="button" onclick="nextQuestion()">Далее</button></div>
+          <div class="next-btn-container"><button class="next-question-btn" data-next-question-btn type="button">Далее</button></div>
         </div>
       `;
     }
@@ -404,7 +405,7 @@ function renderQuiz() {
     }
     if (!correct) {
       html += `<div class="explanation-box"><strong>Объяснение:</strong><br>${markdownInlineToHtmlQuiz(q.explanation || '')}</div>`;
-      html += '<div class="next-btn-container"><button class="next-question-btn" id="nextQuestionBtn">Далее</button></div>';
+      html += '<div class="next-btn-container"><button class="next-question-btn" id="nextQuestionBtn" data-next-question-btn type="button">Далее</button></div>';
     }
   }
 
