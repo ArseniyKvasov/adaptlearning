@@ -335,13 +335,7 @@ function applySelectedAnswer(answerIdx) {
   }
 }
 
-function bindNextButton() {
-  const nextBtn = quizContainer.querySelector('[data-next-question-btn]');
-  if (!nextBtn) return;
-  nextBtn.addEventListener('click', () => {
-    nextQuestion();
-  }, { once: true });
-}
+
 
 function renderQuiz() {
   if (!quizData.length) {
@@ -432,7 +426,10 @@ function renderQuiz() {
   const checkBtn = document.getElementById('checkAnswerBtn');
   if (checkBtn) checkBtn.addEventListener('click', checkOpenEndedAnswer);
 
-  bindNextButton();
+  const nextBtn = quizContainer.querySelector('[data-next-question-btn]');
+  if (nextBtn) {
+    nextBtn.onclick = nextQuestion;
+  }
 
   setTimeout(() => renderMathInContainer(quizContainer), 30);
 }
