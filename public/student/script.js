@@ -41,6 +41,13 @@ function normalizeTextBreaks(text) {
     .replace(/\\n/g, '\n');
 }
 
+function removePunctuationAfterBlockMath(text) {
+  return (text || '').replace(/\$\$[\s\S]*?\$\$[\s]*[.,;:!?]+/g, (match) => {
+    const mathEnd = match.lastIndexOf('$$');
+    return match.slice(0, mathEnd + 2);
+  });
+}
+
 function normalizeQuizText(text) {
   return (text || '')
     .replace(/\\n/g, '\n');
@@ -67,7 +74,7 @@ function markdownInlineToHtmlQuiz(text) {
 }
 
 function formatMarkdownToHtml(text) {
-  const source = escapeHtml(normalizeTextBreaks(text));
+  const source = escapeHtml(normalizeTextBreaks(removePunctuationAfterBlockMath(text)));
   const protectedMath = protectMathSegments(source);
   let html = protectedMath.text;
 
@@ -366,6 +373,33 @@ function applySelectedAnswer(answerIdx) {
   }
 }
 
+function updateQuizSelection(answerIdx) {
+  const root = getQuizItemRoot();
+  const q = quizData[quizState.index];
+  if (!root || !q) return;
+
+  const options = Array.from(root.querySelectorAll('.quiz-option'));
+  const correctIndex = Number(q.correct_answer);
+  const isCorrect = answerIdx === correctIndex;
+
+  root.classList.add('is-answered');
+  options.forEach((node, idx) => {
+    node.classList.remove('correct-highlight', 'wrong-highlight', 'is-selected');
+    if (idx === correctIndex) node.classList.add('correct-highlight');
+    if (idx === answerIdx && !isCorrect) node.classList.add('wrong-highlight');
+    if (idx === answerIdx) node.classList.add('is-selected');
+  });
+
+  if (!isCorrect) {
+    const feedback = root.querySelector('[data-quiz-feedback]');
+    if (feedback) feedback.hidden = false;
+    const nextBtn = root.querySelector('[data-next-question-btn]');
+    if (nextBtn) nextBtn.hidden = false;
+  } else {
+    setTimeout(() => nextQuestion(), 450);
+  }
+}
+
 function renderQuiz() {
   if (!quizData.length) {
     quizContainer.innerHTML = '<div class="status-message">Тест недоступен</div>';
@@ -622,7 +656,7 @@ window.selectAnswer = function selectAnswer(answerIdx) {
   if (quizState.answers[qid] && quizState.answers[qid].answered) return;
   quizState.answers[qid] = { answer: answerIdx, answered: true };
   saveQuizProgress();
-  applySelectedAnswer(answerIdx);
+  updateQuizSelection(answerIdx);
 };
 
 window.checkOpenEndedAnswer = function checkOpenEndedAnswer() {

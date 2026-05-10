@@ -74,6 +74,13 @@ function normalizeTextBreaks(text) {
     .replace(/\\n/g, '\n');
 }
 
+function removePunctuationAfterBlockMath(text) {
+  return (text || '').replace(/\$\$[\s\S]*?\$\$[\s]*[.,;:!?]+/g, (match) => {
+    const mathEnd = match.lastIndexOf('$$');
+    return match.slice(0, mathEnd + 2);
+  });
+}
+
 function normalizeQuizText(text) {
   return (text || '')
     .replace(/\\n/g, '\n');
@@ -192,7 +199,7 @@ function markdownInlineToHtmlQuiz(text) {
 }
 
 function formatMarkdownToHtml(text) {
-  const source = escapeHtml(normalizeTextBreaks(text));
+  const source = escapeHtml(normalizeTextBreaks(removePunctuationAfterBlockMath(text)));
   const protectedMath = protectMathSegments(source);
   let html = protectedMath.text;
 
@@ -1009,6 +1016,33 @@ function renderQuiz(gen) {
   setTimeout(() => renderMathInContainer(quizContainer), 30);
 }
 
+function updateTeacherQuizSelection(gen, answerIdx) {
+  const root = getTeacherQuizItemRoot(gen);
+  const q = gen && Array.isArray(gen.quiz) ? gen.quiz[gen.ui.quizIndex] : null;
+  if (!root || !q) return;
+
+  const options = Array.from(root.querySelectorAll('.quiz-option'));
+  const correctIndex = Number(q.correct_answer);
+  const isCorrect = answerIdx === correctIndex;
+
+  root.classList.add('is-answered');
+  options.forEach((node, idx) => {
+    node.classList.remove('correct-highlight', 'wrong-highlight', 'is-selected');
+    if (idx === correctIndex) node.classList.add('correct-highlight');
+    if (idx === answerIdx && !isCorrect) node.classList.add('wrong-highlight');
+    if (idx === answerIdx) node.classList.add('is-selected');
+  });
+
+  if (!isCorrect) {
+    const feedback = root.querySelector('[data-quiz-feedback]');
+    if (feedback) feedback.hidden = false;
+    const nextBtn = root.querySelector('.next-question-btn');
+    if (nextBtn) nextBtn.hidden = false;
+  } else {
+    setTimeout(() => nextQuestion(), 450);
+  }
+}
+
 function renderAnalytics(gen) {
   if (!gen) {
     analyticsContainer.innerHTML = '<div class="status-message">Аналитика появится после обработки</div>';
@@ -1513,7 +1547,7 @@ window.selectAnswer = function selectAnswer(answerIdx) {
   if (!q) return;
   if (ui.quizAnswers[ui.quizIndex] && ui.quizAnswers[ui.quizIndex].answered) return;
   ui.quizAnswers[ui.quizIndex] = { answer: answerIdx, answered: true };
-  applyTeacherSelectedAnswer(gen, answerIdx);
+  updateTeacherQuizSelection(gen, answerIdx);
 };
 
 window.checkOpenEndedAnswer = function checkOpenEndedAnswer() {
