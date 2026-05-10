@@ -1410,6 +1410,13 @@ body.drawer-open {
   display: inline-block;
 }
 
+.progress-fixed {
+  display: inline-block;
+  min-width: 2.2em;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+
 .history-header {
   margin-bottom: 0.9rem;
 }

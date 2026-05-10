@@ -496,19 +496,19 @@ function renderTranscript(gen) {
   const progress = Math.max(0, Math.min(100, Math.round(Number(gen.progress_percent || 0))));
   const isProcessing = gen.status === 'processing';
   const loaderText = isProcessing
-    ? (progress < 100 ? `Обрабатываем запись ${progress}%` : (!gen.summary.length ? 'Генерируем конспект...' : (!gen.quiz.length ? 'Генерируем тест...' : 'Завершаем обработку...')))
+    ? (progress < 100 ? 'Обрабатываем запись' : (!gen.summary.length ? 'Генерируем конспект...' : (!gen.quiz.length ? 'Генерируем тест...' : 'Завершаем обработку...')))
     : '';
 
   if (transcriptHtml) {
     transcriptContainer.innerHTML = `
       <div class="transcript-list">${transcriptHtml}</div>
-      ${isProcessing ? `<div class="status-message" style="margin-top: 16px;"><span class="spinner-small"></span> ${escapeHtml(loaderText)}</div>` : ''}
+      ${isProcessing ? `<div class="status-message" style="margin-top: 16px;"><span class="spinner-small"></span> ${escapeHtml(loaderText)}${progress < 100 ? ` <span class="progress-fixed">${progress}%</span>` : ''}</div>` : ''}
     `;
     requestAnimationFrame(updateTranscriptJumpButton);
     return;
   }
   if (isProcessing) {
-    transcriptContainer.innerHTML = `<div class="status-message"><span class="spinner-small"></span> ${escapeHtml(loaderText || 'Обрабатываем запись...')}</div>`;
+    transcriptContainer.innerHTML = `<div class="status-message"><span class="spinner-small"></span> ${escapeHtml(loaderText || 'Обрабатываем запись...')}${progress < 100 && loaderText === 'Обрабатываем запись' ? ` <span class="progress-fixed">${progress}%</span>` : ''}</div>`;
     updateTranscriptJumpButton();
     return;
   }
