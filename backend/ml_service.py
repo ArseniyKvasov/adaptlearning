@@ -284,7 +284,7 @@ class MLServiceClient:
             raise MLServiceError("Transcribe response has no valid transcript items", "Не удалось получить текст из аудио. Попробуйте другой файл.")
         return normalized
 
-    async def make_mini_summary(self, chunk_transcript: dict[str, Any]) -> dict[str, Any]:
+    async def _make_mini_summary_once(self, chunk_transcript: dict[str, Any]) -> dict[str, Any]:
         task = await self._submit_task("/mini-summary", chunk_transcript, timeout_s=120)
         task = await self._wait_for_task(task, timeout_s=3600)
         data = self._task_result(task)
@@ -303,7 +303,18 @@ class MLServiceClient:
             "examples": data.get("examples") if isinstance(data.get("examples"), list) else [],
         }
 
-    async def make_lesson_summary(self, mini_summaries: list[dict[str, Any]], topic_hint: str = "") -> list[dict[str, Any]]:
+    async def make_mini_summary(self, chunk_transcript: dict[str, Any]) -> dict[str, Any]:
+        last_error: Exception = MLServiceError("Mini-summary failed", "Не удалось сгенерировать мини-конспект.")
+        for attempt in range(1, 3):
+            try:
+                return await self._make_mini_summary_once(chunk_transcript)
+            except MLServiceError as e:
+                last_error = e
+                print(f"[make_mini_summary] attempt {attempt} failed, retrying...")
+                await asyncio.sleep(1.5 * attempt)
+        raise last_error
+
+    async def _make_lesson_summary_once(self, mini_summaries: list[dict[str, Any]], topic_hint: str = "") -> list[dict[str, Any]]:
         key_points: list[str] = []
         for mini_summary in mini_summaries:
             raw_points = mini_summary.get("key_points")
@@ -340,6 +351,17 @@ class MLServiceClient:
         if not normalized:
             raise MLServiceError("Lesson summary response has no valid sections", "Сервис вернул пустой конспект. Попробуйте повторить генерацию.")
         return normalized
+
+    async def make_lesson_summary(self, mini_summaries: list[dict[str, Any]], topic_hint: str = "") -> list[dict[str, Any]]:
+        last_error: Exception = MLServiceError("Lesson summary failed", "Не удалось сгенерировать конспект.")
+        for attempt in range(1, 3):
+            try:
+                return await self._make_lesson_summary_once(mini_summaries, topic_hint)
+            except MLServiceError as e:
+                last_error = e
+                print(f"[make_lesson_summary] attempt {attempt} failed, retrying...")
+                await asyncio.sleep(1.5 * attempt)
+        raise last_error
 
     async def make_quiz(
         self,
