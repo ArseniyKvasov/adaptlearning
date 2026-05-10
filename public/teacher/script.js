@@ -1069,7 +1069,7 @@ function renderAnalytics(gen) {
 
       <section class="analytics-card ${completed ? '' : 'analytics-card-disabled'}">
         <div class="analytics-title">Освоение подтем</div>
-        ${masteryHtml || '<div class="status-message">Результаты появятся после первой проверки теста учеником.</div>'}
+        ${masteryHtml || '<div class="status-message">Результаты появятся после первого выполнения теста учеником.</div>'}
       </section>
 
       <section class="analytics-card ${completed ? '' : 'analytics-card-disabled'}">
