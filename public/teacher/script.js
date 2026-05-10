@@ -76,8 +76,6 @@ function normalizeTextBreaks(text) {
 
 function normalizeQuizText(text) {
   return (text || '')
-    .replace(/\f/g, '\\f')
-    .replace(/\r/g, '\\r')
     .replace(/\\n/g, '\n');
 }
 
