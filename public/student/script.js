@@ -235,7 +235,13 @@ function buildMastery(results) {
   }));
 }
 
+function hideQuizLoader() {
+  const loader = quizContainer.querySelector('.quiz-final-loader');
+  if (loader) loader.remove();
+}
+
 function renderQuizResults(data) {
+  hideQuizLoader();
   const resultBox = document.getElementById('quizCheckResult');
   if (!resultBox) return;
 
@@ -267,6 +273,7 @@ function renderQuizResults(data) {
 }
 
 function renderQuizCheckError(message) {
+  hideQuizLoader();
   const resultBox = document.getElementById('quizCheckResult');
   if (!resultBox) return;
   resultBox.innerHTML = `
