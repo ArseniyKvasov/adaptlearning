@@ -1185,18 +1185,54 @@ function showSelectedFile(file) {
   generateBtn.disabled = false;
 }
 
+function updateUploadStatus(percent) {
+  const pct = Math.max(0, Math.min(100, Math.round(percent)));
+  uploadStatusDiv.innerHTML = `<div class="file-info">Отправляем файл в обработку… ${pct}%</div>`;
+}
+
 async function createGenerationFromFile() {
   if (!selectedFile) return;
   const fd = new FormData();
   fd.append('file', selectedFile);
   generateBtn.disabled = true;
-  uploadStatusDiv.innerHTML = '<div class="file-info">Отправляем файл в обработку...</div>';
+  updateUploadStatus(0);
   setTabState(summaryTabBtn, false, false);
   setTabState(quizTabBtn, false, false);
   setTabState(analyticsTabBtn, false, false);
 
   try {
-    const created = await api('/api/generations/upload', { method: 'POST', body: fd });
+    const created = await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.upload.addEventListener('progress', (event) => {
+        if (event.lengthComputable) {
+          updateUploadStatus((event.loaded / event.total) * 100);
+        }
+      });
+      xhr.addEventListener('load', () => {
+        if (xhr.status >= 200 && xhr.status < 300) {
+          try {
+            resolve(JSON.parse(xhr.responseText));
+          } catch (_e) {
+            reject(new Error('Некорректный ответ сервера.'));
+          }
+        } else {
+          let detail = 'Ошибка запроса.';
+          try {
+            const body = JSON.parse(xhr.responseText);
+            detail = body.detail || body.error || detail;
+          } catch (_e) {
+            // ignore
+          }
+          const error = new Error(detail);
+          error.status = xhr.status;
+          reject(error);
+        }
+      });
+      xhr.addEventListener('error', () => reject(new Error('Ошибка сети при загрузке файла.')));
+      xhr.addEventListener('abort', () => reject(new Error('Загрузка файла прервана.')));
+      xhr.open('POST', '/api/generations/upload');
+      xhr.send(fd);
+    });
     neutralMode = false;
     activeGenerationId = created.id;
     selectedFile = null;
