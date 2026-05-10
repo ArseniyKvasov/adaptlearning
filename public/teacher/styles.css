@@ -1293,6 +1293,28 @@ body.drawer-open {
   overflow-y: hidden;
 }
 
+.code-block {
+  background: #0d1117;
+  border-radius: 12px;
+  padding: 1rem;
+  margin: 0.75rem 0;
+  overflow-x: auto;
+  font-family: 'SF Mono', 'Fira Code', 'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace;
+  font-size: 0.82rem;
+  line-height: 1.55;
+  border: 1px solid #30363d;
+}
+
+.code-block code {
+  background: transparent;
+  padding: 0;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+  color: #c9d1d9;
+  white-space: pre;
+}
+
 .math-scroll-wrap > .katex-display {
   display: inline-block;
   margin: 0.2rem 0;

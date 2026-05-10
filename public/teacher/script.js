@@ -119,6 +119,17 @@ function renderMathInContainer(container) {
   }
 }
 
+function highlightCodeInContainer(container) {
+  if (!container || !window.hljs) return;
+  container.querySelectorAll('pre.code-block code').forEach((block) => {
+    try {
+      window.hljs.highlightElement(block);
+    } catch (_e) {
+      // ignore
+    }
+  });
+}
+
 function formatDateTime(iso) {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return '';
@@ -184,9 +195,28 @@ function formatMarkdownToHtml(text) {
   const source = escapeHtml(normalizeTextBreaks(text));
   const protectedMath = protectMathSegments(source);
   let html = protectedMath.text;
+
+  // Protect code blocks before paragraph splitting
+  const codeParts = [];
+  html = html.replace(/```([a-zA-Z0-9_+-]*)\n([\s\S]*?)```/g, (match, lang, code) => {
+    const token = `@@CODE_${codeParts.length}@@`;
+    codeParts.push({ lang: lang || 'plaintext', code });
+    return token;
+  });
+
   const blocks = html.split(/\n{2,}/).map((block) => block.trim()).filter(Boolean);
 
   const formattedBlocks = blocks.map((block) => {
+    // Restore code block tokens first
+    if (block.includes('@@CODE_')) {
+      return block.replace(/@@CODE_(\d+)@@/g, (_m, idx) => {
+        const part = codeParts[Number(idx)];
+        if (!part) return '';
+        const langClass = part.lang && part.lang !== 'plaintext' ? `language-${part.lang}` : '';
+        return `<pre class="code-block"><code class="${langClass}">${part.code}</code></pre>`;
+      });
+    }
+
     const listMatch = block.match(/^(?:\* .+(?:\n|$))+$/);
     if (listMatch) {
       const items = block
@@ -818,7 +848,10 @@ function renderSummary(gen) {
     });
   });
   syncSummarySelection();
-  setTimeout(() => renderMathInContainer(summaryContainer), 30);
+  setTimeout(() => {
+    renderMathInContainer(summaryContainer);
+    highlightCodeInContainer(summaryContainer);
+  }, 30);
 }
 
 function syncSummarySelection() {
