@@ -570,14 +570,8 @@ function formatRecommendationAction(action) {
 
   const prefixes = ['Важно разобрать тему', 'Стоит повторить тему'];
   for (const prefix of prefixes) {
-    if (text === prefix) {
+    if (text === prefix || text.startsWith(`${prefix}:`)) {
       return `<strong>${escapeHtml(prefix)}</strong>`;
-    }
-    if (text.startsWith(`${prefix}:`)) {
-      return `<strong>${escapeHtml(prefix)}</strong>${escapeHtml(text.slice(prefix.length))}`;
-    }
-    if (text.startsWith(prefix)) {
-      return `<strong>${escapeHtml(prefix)}</strong>${escapeHtml(text.slice(prefix.length))}`;
     }
   }
 
