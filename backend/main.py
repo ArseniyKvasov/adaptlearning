@@ -694,7 +694,7 @@ def build_recommendations_from_mastery(mastery: list[dict[str, Any]]) -> list[di
             recommendations.append(
                 {
                     "subtopic": subtopic,
-                    "action": f"Важно разобрать тему: {subtopic}",
+                    "action": "Важно разобрать тему",
                     "priority": "high",
                     "percent": percent,
                 }
@@ -703,7 +703,7 @@ def build_recommendations_from_mastery(mastery: list[dict[str, Any]]) -> list[di
             recommendations.append(
                 {
                     "subtopic": subtopic,
-                    "action": f"Стоит повторить тему: {subtopic}",
+                    "action": "Стоит повторить тему",
                     "priority": "medium",
                     "percent": percent,
                 }
