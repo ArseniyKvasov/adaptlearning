@@ -12,6 +12,11 @@ class MLServiceError(Exception):
         self.user_message = user_message
 
 
+def _fix_json_escapes(text: str) -> str:
+    """Restore JSON-escaped \\f and \\r that Python's json parser converted to control chars."""
+    return text.replace("\x0c", "\\f").replace("\x0d", "\\r")
+
+
 class MLServiceClient:
     def __init__(self, api_key: str, base_url: str = "https://ml.fastclass.ru") -> None:
         self.api_key = api_key
@@ -263,7 +268,7 @@ class MLServiceClient:
                 start_value = int(item.get("start_ms", 0) or 0)
             except (TypeError, ValueError):
                 start_value = 0
-            normalized.append({"start_ms": start_value, "text": text})
+            normalized.append({"start_ms": start_value, "text": _fix_json_escapes(text)})
         if not normalized:
             print(
                 "[ML transcribe_chunk] unexpected response: transcript items have no usable text",
@@ -286,7 +291,7 @@ class MLServiceClient:
         key_points_raw = data.get("key_points")
         key_points: list[str] = []
         if isinstance(key_points_raw, list):
-            key_points = [str(item).strip() for item in key_points_raw if str(item).strip()]
+            key_points = [_fix_json_escapes(str(item).strip()) for item in key_points_raw if str(item).strip()]
         if not key_points:
             raise MLServiceError("Mini-summary response has no key_points", "Сервис вернул пустой мини-конспект. Попробуйте повторить генерацию.")
         return {
@@ -327,8 +332,8 @@ class MLServiceClient:
         for idx, item in enumerate(summary):
             if not isinstance(item, dict):
                 continue
-            subtopic = str(item.get("subtopic") or f"Раздел {idx + 1}").strip()
-            content = str(item.get("content") or "").strip()
+            subtopic = _fix_json_escapes(str(item.get("subtopic") or f"Раздел {idx + 1}").strip())
+            content = _fix_json_escapes(str(item.get("content") or "").strip())
             if not subtopic or not content:
                 continue
             normalized.append({"subtopic": subtopic, "content": content})
@@ -359,12 +364,12 @@ class MLServiceClient:
         for idx, item in enumerate(quiz):
             if not isinstance(item, dict):
                 continue
-            question_text = str(item.get("question_text") or "").strip()
+            question_text = _fix_json_escapes(str(item.get("question_text") or "").strip())
             if not question_text:
                 continue
             question_type = str(item.get("question_type") or "multiple_choice").strip().casefold()
-            subtopic = str(item.get("subtopic") or f"Раздел {idx + 1}").strip() or f"Раздел {idx + 1}"
-            explanation = str(item.get("explanation") or "").strip()
+            subtopic = _fix_json_escapes(str(item.get("subtopic") or f"Раздел {idx + 1}").strip()) or f"Раздел {idx + 1}"
+            explanation = _fix_json_escapes(str(item.get("explanation") or "").strip())
             question_id = item.get("question_id")
             if question_id in (None, ""):
                 question_id = idx + 1
@@ -384,7 +389,7 @@ class MLServiceClient:
                         "question_id": int(question_id),
                         "question_text": question_text,
                         "question_type": "multiple_choice",
-                        "options": [str(option or "").strip() for option in options],
+                        "options": [_fix_json_escapes(str(option or "").strip()) for option in options],
                         "correct_answer": correct_answer,
                         "explanation": explanation,
                         "subtopic": subtopic,
@@ -393,7 +398,7 @@ class MLServiceClient:
                 continue
 
             if question_type in {"open_ended", "open_question"}:
-                correct_answer = str(item.get("correct_answer") or "").strip()
+                correct_answer = _fix_json_escapes(str(item.get("correct_answer") or "").strip())
                 if not correct_answer:
                     continue
                 normalized.append(
