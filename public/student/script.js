@@ -438,6 +438,11 @@ function syncSummarySelection() {
   });
 }
 
+function clearSummarySelection() {
+  activeSummarySubtopic = '';
+  syncSummarySelection();
+}
+
 function renderSummary() {
   if (!summaryData.length) {
     summaryContainer.innerHTML = '<div class="status-message">Конспект недоступен</div>';
@@ -448,14 +453,14 @@ function renderSummary() {
     <div class="summary-toc">
       <h4>Оглавление</h4>
       <ul class="toc-list">
-        ${summaryData.map((s, idx) => `<li class="toc-item ${((s.subtopic || '').trim().toLowerCase() === (activeSummarySubtopic || '').trim().toLowerCase()) ? 'active' : ''}" data-section-id="summary-section-${idx}" data-subtopic="${escapeHtml(s.subtopic || '')}">${escapeHtml(s.subtopic || `Раздел ${idx + 1}`)}</li>`).join('')}
+        ${summaryData.map((s, idx) => `<li class="toc-item" data-section-id="summary-section-${idx}" data-subtopic="${escapeHtml(s.subtopic || '')}">${escapeHtml(s.subtopic || `Раздел ${idx + 1}`)}</li>`).join('')}
       </ul>
     </div>
   `;
   const contentHtml = `
     <div class="summary-content">
       ${summaryData.map((s, idx) => `
-        <section id="summary-section-${idx}" class="summary-section ${((s.subtopic || '').trim().toLowerCase() === (activeSummarySubtopic || '').trim().toLowerCase()) ? 'is-active' : ''}">
+        <section id="summary-section-${idx}" class="summary-section">
           <h3>${escapeHtml(s.subtopic || `Раздел ${idx + 1}`)}</h3>
           <div class="content">${formatMarkdownToHtml(s.content || '')}</div>
         </section>
@@ -626,7 +631,7 @@ window.nextQuestion = function nextQuestion() {
   summaryData = Array.isArray(data.summary) ? data.summary : [];
   quizData = Array.isArray(data.quiz) ? data.quiz : [];
   initQuizState();
-  activeSummarySubtopic = '';
+  clearSummarySelection();
   if (data.attempt) {
     quizState.reviewMode = true;
     quizState.checkStatus = 'done';
