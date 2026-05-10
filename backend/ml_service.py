@@ -90,7 +90,10 @@ class MLServiceClient:
             ) from exc
 
         if resp.status_code >= 400:
-            message = self._response_error_message(data) or self._http_user_message(resp.status_code)
+            if resp.status_code == 429:
+                message = self._http_user_message(429)
+            else:
+                message = self._response_error_message(data) or self._http_user_message(resp.status_code)
             raise MLServiceError(f"ML HTTP error ({resp.status_code}): {data}", message)
 
         if not isinstance(data, dict):
@@ -133,7 +136,10 @@ class MLServiceClient:
             ) from exc
 
         if resp.status_code >= 400:
-            message = self._response_error_message(payload) or self._http_user_message(resp.status_code)
+            if resp.status_code == 429:
+                message = self._http_user_message(429)
+            else:
+                message = self._response_error_message(payload) or self._http_user_message(resp.status_code)
             raise MLServiceError(f"ML HTTP error ({resp.status_code}): {payload}", message)
 
         if not isinstance(payload, dict):
@@ -167,7 +173,10 @@ class MLServiceClient:
             ) from exc
 
         if resp.status_code >= 400:
-            message = self._response_error_message(data) or self._http_user_message(resp.status_code)
+            if resp.status_code == 429:
+                message = self._http_user_message(429)
+            else:
+                message = self._response_error_message(data) or self._http_user_message(resp.status_code)
             raise MLServiceError(f"ML task HTTP error ({resp.status_code}): {data}", message)
 
         if not isinstance(data, dict):
