@@ -245,9 +245,17 @@ function renderQuizResults(data) {
   const resultBox = document.getElementById('quizCheckResult');
   if (!resultBox) return;
 
-  const mastery = Array.isArray(data.mastery) ? data.mastery : buildMastery(Array.isArray(data.results) ? data.results : []);
+  const masteryRaw = Array.isArray(data.mastery) ? data.mastery : buildMastery(Array.isArray(data.results) ? data.results : []);
   const allSubtopics = getQuizSubtopics();
-  const filteredMastery = mastery.filter((item) => allSubtopics.includes(item.subtopic));
+  const masteryMap = new Map();
+  masteryRaw.forEach((item) => {
+    if (!allSubtopics.includes(item.subtopic)) return;
+    const existing = masteryMap.get(item.subtopic);
+    if (!existing || item.percent < existing.percent) {
+      masteryMap.set(item.subtopic, item);
+    }
+  });
+  const filteredMastery = Array.from(masteryMap.values());
   const rowsHtml = filteredMastery
     .map((item) => {
       const levelClass = percentClass(item.percent);
