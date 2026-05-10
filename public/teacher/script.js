@@ -1558,7 +1558,39 @@ window.checkOpenEndedAnswer = function checkOpenEndedAnswer() {
   const val = input.value.trim();
   if (!val) return;
   gen.ui.quizAnswers[gen.ui.quizIndex] = { answer: val, answered: true };
-  renderQuiz(gen);
+
+  const root = getTeacherQuizItemRoot(gen);
+  const q = gen.quiz[gen.ui.quizIndex];
+  if (!root || !q) {
+    renderQuiz(gen);
+    return;
+  }
+
+  const openArea = root.querySelector('.open-ended-area');
+  if (openArea) {
+    openArea.innerHTML = `<textarea class="open-ended-input" rows="4" disabled>${escapeHtml(val)}</textarea>`;
+  }
+
+  const explanationHtml = markdownInlineToHtmlQuiz(q.correct_answer || '');
+  const explanationBox = document.createElement('div');
+  explanationBox.className = 'explanation-box';
+  explanationBox.innerHTML = `<strong>Эталонный ответ:</strong><br>${explanationHtml}`;
+  root.appendChild(explanationBox);
+
+  const nextContainer = document.createElement('div');
+  nextContainer.className = 'next-btn-container';
+  nextContainer.innerHTML = '<button class="next-question-btn" type="button">Далее</button>';
+  root.appendChild(nextContainer);
+
+  const nextBtn = nextContainer.querySelector('.next-question-btn');
+  if (nextBtn) {
+    nextBtn.onclick = function() {
+      if (gen.ui.quizIndex >= gen.quiz.length) return;
+      nextQuestion();
+    };
+  }
+
+  setTimeout(() => renderMathInContainer(root), 30);
 };
 
 window.nextQuestion = function nextQuestion() {
