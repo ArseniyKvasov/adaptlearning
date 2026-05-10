@@ -413,6 +413,7 @@ function renderQuiz() {
   const nextBtn = quizContainer.querySelector('.next-question-btn');
   if (nextBtn) {
     nextBtn.onclick = function() {
+      console.log('[nextBtn onclick] clicked, current index:', quizState.index);
       if (quizState.index >= quizData.length) return;
       nextQuestion();
     };
