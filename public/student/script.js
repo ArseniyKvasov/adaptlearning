@@ -380,7 +380,7 @@ function renderQuiz() {
     } else {
       html += `<div class="open-ended-area"><textarea class="open-ended-input" rows="4" disabled>${escapeHtml(quizState.answers[qid].answer || '')}</textarea></div>`;
       html += `<div class="explanation-box"><strong>Эталонный ответ:</strong><br>${markdownInlineToHtmlQuiz(q.correct_answer || '')}</div>`;
-      html += '<div class="next-btn-container"><button class="next-question-btn" data-next-question-btn type="button">Далее</button></div>';
+      html += '<div class="next-btn-container"><button class="next-question-btn" type="button">Далее</button></div>';
     }
   } else {
     const options = Array.isArray(q.options) ? q.options : [];
@@ -390,7 +390,7 @@ function renderQuiz() {
     html += `
       <div class="quiz-feedback" data-quiz-feedback hidden>
         <div class="explanation-box"><strong>Объяснение:</strong><br>${markdownInlineToHtmlQuiz(q.explanation || '')}</div>
-        <div class="next-btn-container"><button class="next-question-btn" data-next-question-btn type="button">Далее</button></div>
+        <div class="next-btn-container"><button class="next-question-btn" type="button">Далее</button></div>
       </div>
     `;
   }
@@ -410,9 +410,12 @@ function renderQuiz() {
   const checkBtn = document.getElementById('checkAnswerBtn');
   if (checkBtn) checkBtn.addEventListener('click', checkOpenEndedAnswer);
 
-  const nextBtn = quizContainer.querySelector('[data-next-question-btn]');
+  const nextBtn = quizContainer.querySelector('.next-question-btn');
   if (nextBtn) {
-    nextBtn.onclick = nextQuestion;
+    nextBtn.onclick = function() {
+      if (quizState.index >= quizData.length) return;
+      nextQuestion();
+    };
   }
 
   if (!open && answered) {
