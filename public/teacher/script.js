@@ -513,7 +513,12 @@ function renderTranscript(gen) {
     return;
   }
   if (gen.status === 'failed') {
-    transcriptContainer.innerHTML = `<div class="status-message">${escapeHtml(gen.error_message || 'Не удалось получить транскрипт.')}</div>`;
+    transcriptContainer.innerHTML = `
+      <div class="status-message status-message-error">
+        ${escapeHtml(gen.error_message || 'Не удалось получить транскрипт.')}
+        <div class="next-btn-container"><button class="next-question-btn" onclick="retryGeneration()">Попробовать снова</button></div>
+      </div>
+    `;
     updateTranscriptJumpButton();
     return;
   }
