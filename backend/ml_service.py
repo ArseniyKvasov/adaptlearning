@@ -373,6 +373,28 @@ class MLServiceClient:
                     await asyncio.sleep(1.5 * attempt)
         raise last_error
 
+    async def make_practice_summary(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        task = await self._submit_task("/practice-summary", payload, timeout_s=180)
+        task = await self._wait_for_task(task, timeout_s=3600)
+        data = self._task_result(task)
+        summary = data.get("summary")
+        if not isinstance(summary, list) or not summary:
+            raise MLServiceError("Practice summary response has no summary list", "Сервис вернул пустой практический конспект. Попробуйте повторить генерацию.")
+
+        normalized: list[dict[str, Any]] = []
+        for idx, item in enumerate(summary):
+            if not isinstance(item, dict):
+                continue
+            subtopic = _fix_json_escapes(str(item.get("subtopic") or f"Раздел {idx + 1}").strip())
+            content = _fix_json_escapes(str(item.get("content") or "").strip())
+            if not subtopic or not content:
+                continue
+            normalized.append({"subtopic": subtopic, "content": content})
+
+        if not normalized:
+            raise MLServiceError("Practice summary response has no valid sections", "Сервис вернул некорректный практический конспект. Попробуйте повторить генерацию.")
+        return normalized
+
     async def make_quiz(
         self,
         summary: list[dict[str, Any]],

@@ -7,11 +7,13 @@ const transcriptContainer = document.getElementById('transcriptContainer');
 const transcriptJumpBtn = document.getElementById('transcriptJumpBtn');
 const summaryContainer = document.getElementById('summaryContainer');
 const quizContainer = document.getElementById('quizContainer');
+const practiceContainer = document.getElementById('practiceContainer');
 const analyticsContainer = document.getElementById('analyticsContainer');
 const editSummaryBtn = document.getElementById('editSummaryBtn');
 const editQuizBtn = document.getElementById('editQuizBtn');
 const summaryTabBtn = document.getElementById('summaryTabBtn');
 const quizTabBtn = document.getElementById('quizTabBtn');
+const practiceTabBtn = document.getElementById('practiceTabBtn');
 const analyticsTabBtn = document.getElementById('analyticsTabBtn');
 const historyList = document.getElementById('historyList');
 const historyListMobile = document.getElementById('historyListMobile');
@@ -27,6 +29,7 @@ const panels = {
   transcript: document.getElementById('panelTranscript'),
   summary: document.getElementById('panelSummary'),
   quiz: document.getElementById('panelQuiz'),
+  practice: document.getElementById('panelPractice'),
   analytics: document.getElementById('panelAnalytics')
 };
 
@@ -84,6 +87,68 @@ function removePunctuationAfterBlockMath(text) {
 function normalizeQuizText(text) {
   return (text || '')
     .replace(/\\n/g, '\n');
+}
+
+function normalizePracticeState(raw) {
+  const state = {
+    status: 'idle',
+    stage: '',
+    weak_subtopics: [],
+    current_weak_subtopics: [],
+    pending_weak_subtopics: [],
+    mastery: {},
+    mastery_order: [],
+    practice_round: 0,
+    round_submitted: false,
+    practice_completed: false,
+    request: {},
+    summary: [],
+    quiz: [],
+    error_message: '',
+    stale_reason: '',
+    updated_at: ''
+  };
+  if (!raw || typeof raw !== 'object') return state;
+  state.status = String(raw.status || state.status);
+  state.stage = String(raw.stage || state.stage);
+  state.error_message = String(raw.error_message || state.error_message);
+  state.stale_reason = String(raw.stale_reason || state.stale_reason);
+  state.updated_at = String(raw.updated_at || state.updated_at);
+  state.practice_round = Number.isFinite(Number(raw.practice_round)) ? Number(raw.practice_round) : state.practice_round;
+  state.round_submitted = Boolean(raw.round_submitted);
+  state.practice_completed = Boolean(raw.practice_completed);
+  if (Array.isArray(raw.weak_subtopics)) {
+    state.weak_subtopics = raw.weak_subtopics.map((item) => String(item || '').trim()).filter(Boolean);
+  }
+  if (Array.isArray(raw.current_weak_subtopics)) {
+    state.current_weak_subtopics = raw.current_weak_subtopics.map((item) => String(item || '').trim()).filter(Boolean);
+  }
+  if (Array.isArray(raw.pending_weak_subtopics)) {
+    state.pending_weak_subtopics = raw.pending_weak_subtopics.map((item) => String(item || '').trim()).filter(Boolean);
+  }
+  if (raw.mastery && typeof raw.mastery === 'object') {
+    state.mastery = raw.mastery;
+  }
+  if (Array.isArray(raw.mastery_order)) {
+    state.mastery_order = raw.mastery_order.map((item) => String(item || '').trim()).filter(Boolean);
+  }
+  if (raw.request && typeof raw.request === 'object') state.request = raw.request;
+  if (Array.isArray(raw.summary)) state.summary = raw.summary;
+  if (Array.isArray(raw.quiz)) state.quiz = raw.quiz;
+  return state;
+}
+
+function practiceHasVisibleState(gen) {
+  const practice = normalizePracticeState(gen && gen.practice ? gen.practice : {});
+  return Boolean(
+    practice.status !== 'idle'
+    || practice.round_submitted
+    || practice.practice_completed
+    || (Array.isArray(practice.summary) && practice.summary.length)
+    || (Array.isArray(practice.quiz) && practice.quiz.length)
+    || (Array.isArray(practice.pending_weak_subtopics) && practice.pending_weak_subtopics.length)
+    || (gen && gen.ui && gen.ui.practiceTabOpened)
+  );
 }
 
 function showPopover(message) {
@@ -358,6 +423,7 @@ function setActiveTab(tab, gen = getActiveGeneration(), render = true) {
   if (tab === 'transcript') renderTranscript(gen);
   if (tab === 'summary') renderSummary(gen);
   if (tab === 'quiz') renderQuiz(gen);
+  if (tab === 'practice') renderPractice(gen);
   if (tab === 'analytics') renderAnalytics(gen);
 }
 
@@ -369,10 +435,22 @@ function enrichGeneration(gen) {
     quizIndex: 0,
     quizAnswers: [],
     quizCheckStatus: 'idle',
-    quizCheckResult: null
+    quizCheckResult: null,
+    practicePromptVisible: false,
+    practiceTabOpened: false,
+    practiceRoundSubmitting: false,
+    practiceQuizIndex: 0,
+    practiceQuizAnswers: [],
+    practiceQuizFinished: false
   };
   if (!nextUi.quizCheckStatus) nextUi.quizCheckStatus = 'idle';
   if (!('quizCheckResult' in nextUi)) nextUi.quizCheckResult = null;
+  if (typeof nextUi.practicePromptVisible !== 'boolean') nextUi.practicePromptVisible = false;
+  if (typeof nextUi.practiceTabOpened !== 'boolean') nextUi.practiceTabOpened = false;
+  if (typeof nextUi.practiceRoundSubmitting !== 'boolean') nextUi.practiceRoundSubmitting = false;
+  if (typeof nextUi.practiceQuizIndex !== 'number') nextUi.practiceQuizIndex = 0;
+  if (!Array.isArray(nextUi.practiceQuizAnswers)) nextUi.practiceQuizAnswers = [];
+  if (typeof nextUi.practiceQuizFinished !== 'boolean') nextUi.practiceQuizFinished = false;
   generationUiState[gen.id] = nextUi;
   return {
     ...gen,
@@ -396,6 +474,7 @@ function updateTabStates(gen) {
   if (!gen) {
     setTabState(summaryTabBtn, false, false);
     setTabState(quizTabBtn, false, false);
+    setTabState(practiceTabBtn, false, false);
     setTabState(analyticsTabBtn, false, false);
     if (getActiveTab() !== 'transcript') setActiveTab('transcript', null, false);
     return;
@@ -404,10 +483,21 @@ function updateTabStates(gen) {
   const hasTranscript = Array.isArray(gen.transcript) && gen.transcript.length > 0;
   const hasSummary = Array.isArray(gen.summary) && gen.summary.length > 0;
   const hasQuiz = Array.isArray(gen.quiz) && gen.quiz.length > 0;
+  const practice = normalizePracticeState(gen.practice || {});
+  const practiceVisible = Boolean(
+    gen.ui.practiceTabOpened
+    || practice.status === 'processing_summary'
+    || practice.status === 'processing_quiz'
+    || practice.round_submitted
+    || practice.practice_completed
+    || (Array.isArray(practice.summary) && practice.summary.length > 0)
+    || (Array.isArray(practice.quiz) && practice.quiz.length > 0)
+  );
   const processing = gen.status === 'processing';
 
   setTabState(summaryTabBtn, hasSummary || gen.status === 'failed', processing && hasTranscript && !hasSummary);
   setTabState(quizTabBtn, hasQuiz || gen.status === 'failed', processing && hasSummary && !hasQuiz);
+  setTabState(practiceTabBtn, practiceVisible, practice.status === 'processing_summary' || practice.status === 'processing_quiz');
   setTabState(analyticsTabBtn, hasQuiz || gen.status === 'failed', processing && hasSummary && !hasQuiz);
 
   const activeTab = getActiveTab();
@@ -732,11 +822,681 @@ function applyTeacherSelectedAnswer(gen, answerIdx) {
   }
 }
 
+function getTeacherPracticeWeakSubtopics(gen) {
+  if (!gen) return [];
+  const ui = gen.ui || {};
+  if (ui.quizCheckResult && Array.isArray(ui.quizCheckResult.recommendations) && ui.quizCheckResult.recommendations.length) {
+    return ui.quizCheckResult.recommendations
+      .map((item) => String(item.subtopic || '').trim())
+      .filter(Boolean);
+  }
+  if (ui.quizCheckResult && Array.isArray(ui.quizCheckResult.mastery)) {
+    return ui.quizCheckResult.mastery
+      .filter((item) => Number(item.percent || 0) < 80)
+      .map((item) => String(item.subtopic || '').trim())
+      .filter(Boolean);
+  }
+  const practice = normalizePracticeState(gen.practice || {});
+  if (Array.isArray(practice.weak_subtopics) && practice.weak_subtopics.length) {
+    return practice.weak_subtopics;
+  }
+  return [];
+}
+
+function getTeacherPracticeMastery(gen) {
+  if (!gen) return [];
+  const ui = gen.ui || {};
+  const mastery = ui.quizCheckResult && Array.isArray(ui.quizCheckResult.mastery)
+    ? ui.quizCheckResult.mastery
+    : [];
+  return mastery
+    .map((item) => ({
+      subtopic: String(item.subtopic || '').trim(),
+      percent: Number(item.percent || 0),
+      correct: Number(item.correct || 0),
+      total: Number(item.total || 0)
+    }))
+    .filter((item) => item.subtopic);
+}
+
+function buildTeacherPracticeQuestionsPayload(gen) {
+  const weakSubtopics = getTeacherPracticeWeakSubtopics(gen);
+  const weakSet = new Set(weakSubtopics.map((item) => item.trim().toLowerCase()));
+  const questions = [];
+  const mastery = getTeacherPracticeMastery(gen);
+
+  (Array.isArray(gen.quiz) ? gen.quiz : []).forEach((q, idx) => {
+    const subtopic = String(q.subtopic || `Подтема ${idx + 1}`).trim();
+    if (weakSet.size && !weakSet.has(subtopic.toLowerCase())) return;
+    const qid = String(q.question_id || idx + 1);
+    const answerState = gen.ui.quizAnswers[idx] || {};
+    const open = q.question_type === 'open_ended' || q.question_type === 'open_question';
+    const selectedIndex = Number(answerState.answer);
+    const selectedText = !open && Array.isArray(q.options) && Number.isInteger(selectedIndex) ? String(q.options[selectedIndex] || '').trim() : '';
+    const correctIndex = Number(q.correct_answer);
+    const correctText = !open && Array.isArray(q.options) && Number.isInteger(correctIndex) ? String(q.options[correctIndex] || '').trim() : String(q.correct_answer || '').trim();
+    const studentText = open ? String(answerState.answer || '').trim() : selectedText;
+
+    questions.push({
+      question_id: qid,
+      question_type: open ? 'open_ended' : 'multiple_choice',
+      subtopic,
+      question_text: String(q.question_text || '').trim(),
+      student_answer: studentText,
+      correct_answer: correctText,
+      is_correct: open ? false : (Number.isInteger(selectedIndex) && selectedIndex === correctIndex),
+      explanation: String(q.explanation || '').trim()
+    });
+  });
+
+  if (!questions.length) {
+    (Array.isArray(gen.quiz) ? gen.quiz : []).forEach((q, idx) => {
+      const subtopic = String(q.subtopic || `Подтема ${idx + 1}`).trim();
+      const qid = String(q.question_id || idx + 1);
+      const answerState = gen.ui.quizAnswers[idx] || {};
+      const open = q.question_type === 'open_ended' || q.question_type === 'open_question';
+      const selectedIndex = Number(answerState.answer);
+      const selectedText = !open && Array.isArray(q.options) && Number.isInteger(selectedIndex) ? String(q.options[selectedIndex] || '').trim() : '';
+      const correctIndex = Number(q.correct_answer);
+      const correctText = !open && Array.isArray(q.options) && Number.isInteger(correctIndex) ? String(q.options[correctIndex] || '').trim() : String(q.correct_answer || '').trim();
+      const studentText = open ? String(answerState.answer || '').trim() : selectedText;
+
+      questions.push({
+        question_id: qid,
+        question_type: open ? 'open_ended' : 'multiple_choice',
+        subtopic,
+        question_text: String(q.question_text || '').trim(),
+        student_answer: studentText,
+        correct_answer: correctText,
+        is_correct: open ? false : (Number.isInteger(selectedIndex) && selectedIndex === correctIndex),
+        explanation: String(q.explanation || '').trim()
+      });
+    });
+  }
+
+  return {
+    weak_subtopics: weakSubtopics,
+    mastery,
+    questions
+  };
+}
+
+function buildTeacherPracticeCompletionPayload(gen) {
+  const practice = normalizePracticeState(gen && gen.practice ? gen.practice : {});
+  const quiz = Array.isArray(practice.quiz) ? practice.quiz : [];
+  const answers = quiz.map((q, idx) => {
+    const qid = String(q.question_id || idx + 1);
+    const qtype = q.question_type === 'open_ended' || q.question_type === 'open_question' ? 'open_question' : 'multiple_choice';
+    const answerState = gen.ui.practiceQuizAnswers[idx] || {};
+    if (qtype === 'multiple_choice') {
+      const selected = answerState.answer;
+      const correctAnswer = Number(q.correct_answer);
+      return {
+        question_id: qid,
+        question_type: 'multiple_choice',
+        subtopic: q.subtopic || `Подтема ${idx + 1}`,
+        is_correct: Number.isInteger(selected) && selected === correctAnswer
+      };
+    }
+    return {
+      question_id: qid,
+      question_type: 'open_question',
+      subtopic: q.subtopic || `Подтема ${idx + 1}`,
+      question_text: q.question_text || '',
+      correct_answer: q.correct_answer || '',
+      student_answer: typeof answerState.answer === 'string' ? answerState.answer : String(answerState.answer || '')
+    };
+  });
+  return { answers };
+}
+
+function getTeacherPracticeActionState(gen) {
+  const practice = normalizePracticeState(gen && gen.practice ? gen.practice : {});
+  const pending = Array.isArray(practice.pending_weak_subtopics) ? practice.pending_weak_subtopics : [];
+  if (practice.practice_completed || (!pending.length && practice.round_submitted)) {
+    return {
+      label: 'Практика пройдена',
+      disabled: true,
+      kind: 'done'
+    };
+  }
+  if (
+    pending.length
+    || practice.round_submitted
+    || (practice.practice_round > 0 && (Array.isArray(practice.summary) && practice.summary.length || Array.isArray(practice.quiz) && practice.quiz.length))
+  ) {
+    return {
+      label: 'Продолжить практику',
+      disabled: false,
+      kind: 'continue'
+    };
+  }
+  const weakSubtopics = getTeacherPracticeWeakSubtopics(gen);
+  if (weakSubtopics.length) {
+    return {
+      label: 'Перейти к практике',
+      disabled: false,
+      kind: 'start'
+    };
+  }
+  return null;
+}
+
+function renderPracticeQuizLoader(message = 'Генерируем практику...', subtitle = 'Собираем задания на основе практического конспекта') {
+  practiceContainer.innerHTML = `
+    <div class="practice-layout">
+      <div class="practice-summary-card">
+        <h3>Практический конспект</h3>
+        <div class="practice-status">Готовим практический конспект...</div>
+      </div>
+      <div class="practice-quiz-card" id="practiceQuizArea">
+        <div class="quiz-final-loader">
+          <div class="quiz-spinner"></div>
+          <div class="quiz-final-loader-title">${escapeHtml(message)}</div>
+          <div class="quiz-final-loader-subtitle">${escapeHtml(subtitle)}</div>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+function renderPracticeSummary(gen) {
+  const practice = normalizePracticeState(gen && gen.practice ? gen.practice : {});
+  if (!practiceContainer) return;
+
+  const summary = Array.isArray(practice.summary) ? practice.summary : [];
+  if (practice.status === 'idle' && !summary.length) {
+    practiceContainer.innerHTML = '<div class="status-message">Практика появится после прохождения теста</div>';
+    return;
+  }
+  if (practice.status === 'processing_summary') {
+    renderPracticeQuizLoader('Готовим практику...', 'Подбираем материалы по слабым подтемам');
+    return;
+  }
+  if (practice.status === 'stale') {
+    practiceContainer.innerHTML = `
+      <div class="practice-layout">
+        <div class="practice-summary-card">
+          <div class="practice-status">${escapeHtml(practice.stale_reason || 'Практика устарела после изменения конспекта или теста.')}</div>
+        </div>
+      </div>
+    `;
+    return;
+  }
+  if (practice.status === 'failed' && practice.stage === 'summary' && !summary.length) {
+    practiceContainer.innerHTML = `
+      <div class="practice-layout">
+        <div class="practice-summary-card">
+          <div class="practice-status">${escapeHtml(practice.error_message || 'Не удалось собрать практический конспект.')}</div>
+          <div class="practice-action-row">
+            <button class="next-question-btn" type="button" onclick="startTeacherPractice()">Попробовать еще раз</button>
+          </div>
+        </div>
+      </div>
+    `;
+    return;
+  }
+  if (!summary.length) {
+    practiceContainer.innerHTML = '<div class="status-message">Практика пока недоступна</div>';
+    return;
+  }
+
+  const summaryHtml = summary
+    .map((section, idx) => `
+      <div class="practice-section">
+        <h4>${escapeHtml(section.subtopic || `Раздел ${idx + 1}`)}</h4>
+        <div class="content">${formatMarkdownToHtml(section.content || '')}</div>
+      </div>
+    `)
+    .join('<hr class="practice-divider">');
+
+  if (practice.round_submitted) {
+    const isFinal = practice.practice_completed || !(Array.isArray(practice.pending_weak_subtopics) && practice.pending_weak_subtopics.length);
+    const pendingText = Array.isArray(practice.pending_weak_subtopics) && practice.pending_weak_subtopics.length
+      ? `Остались темы: ${escapeHtml(practice.pending_weak_subtopics.join(', '))}.`
+      : 'Все темы уже закреплены выше порога.';
+    practiceContainer.innerHTML = `
+      <div class="practice-layout">
+        <div class="practice-summary-card" id="practiceSummaryArea">
+          <h3>Практический конспект</h3>
+          ${summaryHtml}
+          <div class="practice-status">${isFinal ? 'Практика завершена.' : `Раунд завершен. ${pendingText}`}</div>
+          <div class="practice-action-row">
+            <button class="next-question-btn" type="button" ${isFinal ? 'disabled' : 'onclick="startTeacherPractice()"'}>${isFinal ? 'Практика пройдена' : 'Продолжить практику'}</button>
+          </div>
+        </div>
+        <div class="practice-quiz-card">
+          <div class="quiz-complete">${isFinal ? 'Все темы закреплены. Можно вернуться к материалу или пересмотреть конспект.' : 'Текущий раунд завершен. Можно продолжить практику.'}</div>
+        </div>
+      </div>
+    `;
+    setTimeout(() => {
+      renderMathInContainer(practiceContainer);
+      highlightCodeInContainer(practiceContainer);
+    }, 30);
+    return;
+  }
+  if (practice.practice_completed) {
+    practiceContainer.innerHTML = `
+      <div class="practice-layout">
+        <div class="practice-summary-card" id="practiceSummaryArea">
+          <h3>Практический конспект</h3>
+          ${summaryHtml}
+          <div class="practice-status">Практика пройдена.</div>
+          <div class="practice-action-row">
+            <button class="next-question-btn" type="button" disabled>Практика пройдена</button>
+          </div>
+        </div>
+        <div class="practice-quiz-card">
+          <div class="quiz-complete">Все темы уже закреплены выше 80%.</div>
+        </div>
+      </div>
+    `;
+    setTimeout(() => {
+      renderMathInContainer(practiceContainer);
+      highlightCodeInContainer(practiceContainer);
+    }, 30);
+    return;
+  }
+
+  const quizPanelHtml = practice.status === 'processing_quiz'
+    ? `
+      <div class="practice-quiz-card" id="practiceQuizArea">
+        <div class="quiz-final-loader">
+          <div class="quiz-spinner"></div>
+          <div class="quiz-final-loader-title">Генерируем практику...</div>
+          <div class="quiz-final-loader-subtitle">Собираем задания на основе практического конспекта</div>
+        </div>
+      </div>
+    `
+    : (practice.status === 'failed' && practice.stage === 'quiz'
+      ? `
+        <div class="practice-quiz-card" id="practiceQuizArea">
+          <div class="practice-status">${escapeHtml(practice.error_message || 'Не удалось сгенерировать практический тест.')}</div>
+          <div class="practice-action-row">
+            <button class="next-question-btn" type="button" onclick="startTeacherPracticeQuiz()">Попробовать еще раз</button>
+          </div>
+        </div>
+      `
+      : '<div class="practice-quiz-card" id="practiceQuizArea"></div>');
+
+  practiceContainer.innerHTML = `
+    <div class="practice-layout">
+      <div class="practice-summary-card" id="practiceSummaryArea">
+        <h3>Практический конспект</h3>
+        ${summaryHtml}
+      </div>
+      ${quizPanelHtml}
+    </div>
+  `;
+
+  setTimeout(() => {
+    renderMathInContainer(practiceContainer);
+    highlightCodeInContainer(practiceContainer);
+  }, 30);
+}
+
+function renderPracticeQuiz(gen) {
+  const practice = normalizePracticeState(gen && gen.practice ? gen.practice : {});
+  const quizArea = practiceContainer ? practiceContainer.querySelector('#practiceQuizArea') : null;
+  const quiz = Array.isArray(practice.quiz) ? practice.quiz : [];
+  if (gen && gen.ui && gen.ui.practiceRoundSubmitting && quizArea) {
+    quizArea.innerHTML = `
+      <div class="quiz-final-loader">
+        <div class="quiz-spinner"></div>
+        <div class="quiz-final-loader-title">Проверяем практику...</div>
+        <div class="quiz-final-loader-subtitle">Смотрим, какие темы уже можно убрать из очереди</div>
+      </div>
+    `;
+    return;
+  }
+  if (!quiz.length) {
+    if (quizArea) quizArea.innerHTML = '<div class="status-message">Практический тест появится после генерации</div>';
+    return;
+  }
+
+  const ui = gen.ui;
+  if (typeof ui.practiceQuizIndex !== 'number') ui.practiceQuizIndex = 0;
+  if (!Array.isArray(ui.practiceQuizAnswers)) ui.practiceQuizAnswers = [];
+  if (typeof ui.practiceQuizFinished !== 'boolean') ui.practiceQuizFinished = false;
+
+  if (ui.practiceQuizFinished || ui.practiceQuizIndex >= quiz.length) {
+    if (quizArea) {
+      quizArea.innerHTML = '<div class="quiz-complete">Практика завершена. Можно вернуться к конспекту или повторить задания.</div>';
+    }
+    setTimeout(() => renderMathInContainer(quizArea || practiceContainer), 30);
+    return;
+  }
+
+  const q = quiz[ui.practiceQuizIndex];
+  const answered = ui.practiceQuizAnswers[ui.practiceQuizIndex] && ui.practiceQuizAnswers[ui.practiceQuizIndex].answered;
+  const open = q.question_type === 'open_ended' || q.question_type === 'open_question';
+  const qid = String(q.question_id || ui.practiceQuizIndex + 1);
+
+  let html = `<div class="quiz-item" data-question-idx="${ui.practiceQuizIndex}"><div class="quiz-question">${ui.practiceQuizIndex + 1}. ${markdownInlineToHtmlQuiz(q.question_text || '')}</div>`;
+
+  if (open) {
+    if (!answered) {
+      html += '<div class="open-ended-area"><textarea id="practiceOpenAnswer" class="open-ended-input" rows="4" placeholder="Введите ваш ответ..."></textarea><button class="check-answer-btn" id="practiceCheckAnswerBtn">Проверить ответ</button></div>';
+    } else {
+      html += `<div class="open-ended-area"><textarea class="open-ended-input" rows="4" disabled>${escapeHtml(ui.practiceQuizAnswers[ui.practiceQuizIndex].answer || '')}</textarea></div>`;
+      html += `<div class="explanation-box"><strong>Эталонный ответ:</strong><br>${markdownInlineToHtmlQuiz(q.correct_answer || '')}</div>`;
+      html += '<div class="next-btn-container"><button class="next-question-btn" type="button">Далее</button></div>';
+    }
+  } else {
+    const options = Array.isArray(q.options) ? q.options : [];
+    for (let i = 0; i < options.length; i++) {
+      html += `<div class="quiz-option" data-opt-index="${i}"><label>${markdownInlineToHtmlQuiz(options[i] || '')}</label></div>`;
+    }
+    html += `
+      <div class="quiz-feedback" data-quiz-feedback hidden>
+        <div class="explanation-box"><strong>Объяснение:</strong><br>${markdownInlineToHtmlQuiz(q.explanation || '')}</div>
+        <div class="next-btn-container"><button class="next-question-btn" type="button">Далее</button></div>
+      </div>
+    `;
+  }
+
+  html += '</div>';
+  if (quizArea) {
+    quizArea.innerHTML = html;
+  } else {
+    practiceContainer.innerHTML = html;
+  }
+
+  const targetRoot = quizArea || practiceContainer;
+
+  if (!open) {
+    targetRoot.querySelectorAll('.quiz-option').forEach((node) => {
+      node.addEventListener('click', () => {
+        const idx = parseInt(node.getAttribute('data-opt-index'), 10);
+        selectTeacherPracticeAnswer(gen, idx);
+      });
+    });
+  }
+
+  const checkBtn = document.getElementById('practiceCheckAnswerBtn');
+  if (checkBtn) checkBtn.addEventListener('click', () => checkTeacherPracticeOpenEndedAnswer(gen));
+
+  const nextBtn = targetRoot.querySelector('.next-question-btn');
+  if (nextBtn) {
+    nextBtn.onclick = function() {
+      if (ui.practiceQuizIndex >= quiz.length) return;
+      nextTeacherPracticeQuestion(gen);
+    };
+  }
+
+  if (!open && answered) {
+    applyTeacherPracticeSelectedAnswer(gen, ui.practiceQuizAnswers[ui.practiceQuizIndex].answer);
+  }
+
+  setTimeout(() => renderMathInContainer(targetRoot), 30);
+}
+
+function applyTeacherPracticeSelectedAnswer(gen, answerIdx) {
+  const root = practiceContainer ? practiceContainer.querySelector(`#practiceQuizArea .quiz-item[data-question-idx="${gen.ui.practiceQuizIndex}"]`) : null;
+  const q = gen && Array.isArray(gen.practice?.quiz) ? gen.practice.quiz[gen.ui.practiceQuizIndex] : null;
+  if (!root || !q) return;
+
+  const options = Array.from(root.querySelectorAll('.quiz-option'));
+  const correctIndex = Number(q.correct_answer);
+  const isCorrect = answerIdx === correctIndex;
+
+  root.classList.add('is-answered');
+  options.forEach((node, idx) => {
+    node.classList.remove('correct-highlight', 'wrong-highlight', 'is-selected');
+    if (idx === correctIndex) node.classList.add('correct-highlight');
+    if (idx === answerIdx && !isCorrect) node.classList.add('wrong-highlight');
+    if (idx === answerIdx) node.classList.add('is-selected');
+  });
+
+  if (!isCorrect) {
+    const feedback = root.querySelector('[data-quiz-feedback]');
+    if (feedback) feedback.hidden = false;
+    const nextBtn = root.querySelector('.next-question-btn');
+    if (nextBtn) nextBtn.hidden = false;
+  } else {
+    setTimeout(() => nextTeacherPracticeQuestion(gen), 450);
+  }
+}
+
+function selectTeacherPracticeAnswer(gen, answerIdx) {
+  const q = Array.isArray(gen.practice?.quiz) ? gen.practice.quiz[gen.ui.practiceQuizIndex] : null;
+  if (!q) return;
+  const qid = String(q.question_id || gen.ui.practiceQuizIndex + 1);
+  if (gen.ui.practiceQuizAnswers[gen.ui.practiceQuizIndex] && gen.ui.practiceQuizAnswers[gen.ui.practiceQuizIndex].answered) return;
+  gen.ui.practiceQuizAnswers[gen.ui.practiceQuizIndex] = { answer: answerIdx, answered: true };
+  applyTeacherPracticeSelectedAnswer(gen, answerIdx);
+}
+
+function checkTeacherPracticeOpenEndedAnswer(gen) {
+  const q = Array.isArray(gen.practice?.quiz) ? gen.practice.quiz[gen.ui.practiceQuizIndex] : null;
+  if (!q) return;
+  const input = document.getElementById('practiceOpenAnswer');
+  if (!input) return;
+  const val = input.value.trim();
+  if (!val) return;
+  const qid = String(q.question_id || gen.ui.practiceQuizIndex + 1);
+  gen.ui.practiceQuizAnswers[gen.ui.practiceQuizIndex] = { answer: val, answered: true };
+
+  const root = practiceContainer ? practiceContainer.querySelector(`#practiceQuizArea .quiz-item[data-question-idx="${gen.ui.practiceQuizIndex}"]`) : null;
+  if (!root) {
+    renderPracticeQuiz(gen);
+    return;
+  }
+
+  const openArea = root.querySelector('.open-ended-area');
+  if (openArea) {
+    openArea.innerHTML = `<textarea class="open-ended-input" rows="4" disabled>${escapeHtml(val)}</textarea>`;
+  }
+
+  const explanationHtml = markdownInlineToHtmlQuiz(q.correct_answer || '');
+  const explanationBox = document.createElement('div');
+  explanationBox.className = 'explanation-box';
+  explanationBox.innerHTML = `<strong>Эталонный ответ:</strong><br>${explanationHtml}`;
+  root.appendChild(explanationBox);
+
+  const nextContainer = document.createElement('div');
+  nextContainer.className = 'next-btn-container';
+  nextContainer.innerHTML = '<button class="next-question-btn" type="button">Далее</button>';
+  root.appendChild(nextContainer);
+
+  const nextBtn = nextContainer.querySelector('.next-question-btn');
+  if (nextBtn) {
+    nextBtn.onclick = function() {
+      if (gen.ui.practiceQuizIndex >= gen.practice.quiz.length) return;
+      nextTeacherPracticeQuestion(gen);
+    };
+  }
+
+  setTimeout(() => renderMathInContainer(root), 30);
+}
+
+function nextTeacherPracticeQuestion(gen) {
+  if (!Array.isArray(gen.practice?.quiz) || gen.ui.practiceQuizIndex >= gen.practice.quiz.length) {
+    submitTeacherPracticeRound(gen);
+    return;
+  }
+  if (gen.ui.practiceQuizIndex + 1 < gen.practice.quiz.length) gen.ui.practiceQuizIndex += 1;
+  else submitTeacherPracticeRound(gen);
+  renderPracticeQuiz(gen);
+}
+
+async function submitTeacherPracticeRound(gen = getActiveGeneration()) {
+  if (gen.ui.practiceRoundSubmitting) return;
+  gen.ui.practiceRoundSubmitting = true;
+  renderPracticeQuiz(gen);
+
+  try {
+    const data = await api(`/api/student/${gen.id}/practice/complete`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(buildTeacherPracticeCompletionPayload(gen))
+    });
+    gen.ui.practiceRoundSubmitting = false;
+    if (data && data.practice) {
+      gen.practice = normalizePracticeState(data.practice);
+    }
+    resetTeacherPracticeState(gen);
+    renderPractice(gen);
+  } catch (e) {
+    gen.ui.practiceRoundSubmitting = false;
+    gen.ui.practiceQuizFinished = true;
+    if (practiceContainer) {
+      const quizArea = practiceContainer.querySelector('#practiceQuizArea');
+      if (quizArea) {
+        quizArea.innerHTML = `
+          <div class="practice-status">${escapeHtml(e.message || 'Не удалось сохранить результат практики.')}</div>
+          <div class="practice-action-row">
+            <button class="next-question-btn" type="button" onclick="submitTeacherPracticeRound()">Попробовать еще раз</button>
+          </div>
+        `;
+      }
+    }
+  }
+}
+
+function resetTeacherPracticeState(gen) {
+  gen.ui.practiceQuizIndex = 0;
+  gen.ui.practiceQuizAnswers = [];
+  gen.ui.practiceQuizFinished = false;
+  gen.ui.practiceRoundSubmitting = false;
+}
+
+function openTeacherPracticeTab(gen) {
+  if (!gen || !gen.ui) return;
+  gen.ui.practiceTabOpened = true;
+  ensurePracticeTabVisible(true);
+}
+
+async function startTeacherPractice(gen = getActiveGeneration()) {
+  if (!gen) return;
+  const actionState = getTeacherPracticeActionState(gen);
+  if (actionState && actionState.kind === 'done') {
+    openTeacherPracticeTab(gen);
+    setActiveTab('practice', gen);
+    renderPractice(gen);
+    return;
+  }
+  const isContinue = actionState && actionState.kind === 'continue';
+  const payload = isContinue ? {} : buildTeacherPracticeQuestionsPayload(gen);
+  if (!isContinue && !payload.weak_subtopics.length) {
+    showPopover('Сначала нужен результат теста с рекомендациями по подтемам.');
+    return;
+  }
+  openTeacherPracticeTab(gen);
+  setActiveTab('practice', gen);
+  gen.practice = normalizePracticeState({
+    ...gen.practice,
+    status: 'processing_summary',
+    stage: 'summary',
+    error_message: '',
+    stale_reason: ''
+  });
+  renderPractice(gen);
+
+  try {
+    const data = await api(`/api/student/${gen.id}/practice`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload)
+    });
+    gen.practice = normalizePracticeState(data.practice || gen.practice);
+    resetTeacherPracticeState(gen);
+    renderPractice(gen);
+    if (Array.isArray(gen.practice.summary) && gen.practice.summary.length && !gen.practice.round_submitted) {
+      await startTeacherPracticeQuiz(gen);
+    }
+  } catch (e) {
+    gen.practice = normalizePracticeState({
+      ...gen.practice,
+      status: 'failed',
+      stage: 'summary',
+      error_message: e.message || 'Не удалось сгенерировать практический конспект.'
+    });
+    renderPractice(gen);
+  }
+}
+
+async function startTeacherPracticeQuiz(gen = getActiveGeneration()) {
+  if (!gen) return;
+  const practice = normalizePracticeState(gen.practice || {});
+  if (practice.practice_completed && (!Array.isArray(practice.pending_weak_subtopics) || !practice.pending_weak_subtopics.length)) {
+    openTeacherPracticeTab(gen);
+    setActiveTab('practice', gen);
+    renderPractice(gen);
+    return;
+  }
+  if (practice.status === 'completed' && Array.isArray(practice.quiz) && practice.quiz.length && !practice.round_submitted) {
+    openTeacherPracticeTab(gen);
+    setActiveTab('practice', gen);
+    renderPractice(gen);
+    return;
+  }
+  if (!Array.isArray(practice.summary) || !practice.summary.length) {
+    await startTeacherPractice(gen);
+    return;
+  }
+  openTeacherPracticeTab(gen);
+  setActiveTab('practice', gen);
+  gen.practice = normalizePracticeState({
+    ...practice,
+    status: 'processing_quiz',
+    stage: 'quiz',
+    error_message: '',
+    stale_reason: ''
+  });
+  renderPractice(gen);
+
+  try {
+    const data = await api(`/api/student/${gen.id}/practice/quiz`, {
+      method: 'POST'
+    });
+    gen.practice = normalizePracticeState(data.practice || gen.practice);
+    resetTeacherPracticeState(gen);
+    renderPractice(gen);
+  } catch (e) {
+    gen.practice = normalizePracticeState({
+      ...gen.practice,
+      status: 'failed',
+      stage: 'quiz',
+      error_message: e.message || 'Не удалось сгенерировать практический тест.'
+    });
+    renderPractice(gen);
+  }
+}
+
+function ensurePracticeTabVisible(enable = true) {
+  if (!practiceTabBtn) return;
+  practiceTabBtn.hidden = false;
+  practiceTabBtn.disabled = !enable ? false : false;
+  practiceTabBtn.style.opacity = '1';
+}
+
+function renderPractice(gen) {
+  if (!gen) {
+    practiceContainer.innerHTML = '<div class="status-message">Практика появится после прохождения теста</div>';
+    return;
+  }
+  const practice = normalizePracticeState(gen.practice || {});
+  gen.practice = practice;
+  renderPracticeSummary(gen);
+  if (practice.status === 'completed' && Array.isArray(practice.quiz) && practice.quiz.length && !practice.round_submitted) {
+    renderPracticeQuiz(gen);
+  }
+}
+
 function renderQuizCheckResults(data) {
   const gen = getActiveGeneration();
   const mastery = buildQuizMastery(Array.isArray(data.results) ? data.results : []);
   const allSubtopics = getQuizSubtopics(gen.quiz);
   const filteredMastery = mastery.filter(item => allSubtopics.includes(item.subtopic));
+  const weakSubtopics = Array.isArray(data.recommendations) && data.recommendations.length
+    ? data.recommendations.map((item) => String(item.subtopic || '').trim()).filter(Boolean)
+    : filteredMastery.filter((item) => Number(item.percent || 0) < 80).map((item) => String(item.subtopic || '').trim()).filter(Boolean);
+  const practiceAction = getTeacherPracticeActionState(gen);
+  if (gen && gen.ui) {
+    gen.ui.practicePromptVisible = weakSubtopics.length > 0;
+  }
   const rowsHtml = filteredMastery
     .map((item) => {
       const levelClass = percentClass(item.percent);
@@ -756,6 +1516,11 @@ function renderQuizCheckResults(data) {
     <div class="quiz-results-card">
       <h3>Результаты теста</h3>
       <div class="quiz-results-grid">${rowsHtml || '<div class="status-message">Нет данных для анализа.</div>'}</div>
+      ${practiceAction ? `
+        <div class="practice-action-row">
+          <button class="next-question-btn" type="button" ${practiceAction.disabled ? 'disabled' : 'onclick="startTeacherPractice()"'}>${escapeHtml(practiceAction.label)}</button>
+        </div>
+      ` : ''}
     </div>
   `;
   setTimeout(() => renderMathInContainer(quizContainer), 30);
@@ -1229,6 +1994,10 @@ function updateUploadStatus(percent) {
   uploadStatusDiv.innerHTML = `<div class="file-info">Отправляем файл в обработку… ${pct}%</div>`;
 }
 
+function normalizeUploadErrorMessage(message) {
+  return String(message || '') === 'File too large' ? 'Файл слишком большой' : String(message || '');
+}
+
 async function createGenerationFromFile() {
   if (!selectedFile) return;
   const fd = new FormData();
@@ -1262,6 +2031,7 @@ async function createGenerationFromFile() {
           } catch (_e) {
             // ignore
           }
+          detail = normalizeUploadErrorMessage(detail);
           const error = new Error(detail);
           error.status = xhr.status;
           reject(error);
@@ -1279,7 +2049,7 @@ async function createGenerationFromFile() {
     uploadStatusDiv.innerHTML = '';
     await refresh();
   } catch (e) {
-    uploadStatusDiv.innerHTML = `<div class="file-info">${escapeHtml(e.message || 'Не удалось запустить обработку файла.')}</div>`;
+    uploadStatusDiv.innerHTML = `<div class="file-info">${escapeHtml(normalizeUploadErrorMessage(e.message || 'Не удалось запустить обработку файла.'))}</div>`;
     generateBtn.disabled = false;
   }
 }

@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import json
 import math
 import os
@@ -70,8 +72,10 @@ def init_db() -> None:
           progress_percent REAL NOT NULL DEFAULT 0,
           created_at TEXT NOT NULL,
           transcript_json TEXT NOT NULL,
+          mini_summary_json TEXT NOT NULL,
           summary_json TEXT NOT NULL,
           quiz_json TEXT NOT NULL,
+          practice_json TEXT NOT NULL,
           analytics_json TEXT NOT NULL,
           FOREIGN KEY (user_id) REFERENCES users(id)
         )
@@ -96,6 +100,12 @@ def init_db() -> None:
     cols = [r[1] for r in conn.execute("PRAGMA table_info(generations)").fetchall()]
     if "progress_percent" not in cols:
         conn.execute("ALTER TABLE generations ADD COLUMN progress_percent REAL NOT NULL DEFAULT 0")
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(generations)").fetchall()]
+    if "mini_summary_json" not in cols:
+        conn.execute("ALTER TABLE generations ADD COLUMN mini_summary_json TEXT NOT NULL DEFAULT '[]'")
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(generations)").fetchall()]
+    if "practice_json" not in cols:
+        conn.execute("ALTER TABLE generations ADD COLUMN practice_json TEXT NOT NULL DEFAULT '{}'")
     conn.execute(
         """
         CREATE TABLE IF NOT EXISTS transcript_cache (
@@ -170,6 +180,12 @@ def ensure_guest_user(request: Request) -> str:
 
 def row_to_generation(row: sqlite3.Row) -> dict[str, Any]:
     creator_id = row["creator_id"] if "creator_id" in row.keys() else row["user_id"]
+    practice_raw = {}
+    if "practice_json" in row.keys():
+        try:
+            practice_raw = json.loads(row["practice_json"]) if row["practice_json"] else {}
+        except json.JSONDecodeError:
+            practice_raw = {}
     return {
         "id": row["id"],
         "user_id": row["user_id"],
@@ -179,8 +195,10 @@ def row_to_generation(row: sqlite3.Row) -> dict[str, Any]:
         "progress_percent": float(row["progress_percent"]) if "progress_percent" in row.keys() and row["progress_percent"] is not None else 0,
         "created_at": row["created_at"],
         "transcript": json.loads(row["transcript_json"]),
+        "mini_summary": json.loads(row["mini_summary_json"]) if "mini_summary_json" in row.keys() else [],
         "summary": json.loads(row["summary_json"]),
         "quiz": json.loads(row["quiz_json"]),
+        "practice": practice_raw if isinstance(practice_raw, dict) else {},
         "analytics": json.loads(row["analytics_json"]),
         "error_message": row["error_message"] if "error_message" in row.keys() else "",
     }
@@ -264,24 +282,593 @@ def get_generation(generation_id: str) -> Optional[dict[str, Any]]:
     return row_to_generation(row) if row else None
 
 
+def default_practice_state() -> dict[str, Any]:
+    return {
+        "status": "idle",
+        "stage": "",
+        "weak_subtopics": [],
+        "current_weak_subtopics": [],
+        "pending_weak_subtopics": [],
+        "mastery": {},
+        "mastery_order": [],
+        "practice_round": 0,
+        "round_submitted": False,
+        "practice_completed": False,
+        "request": {},
+        "summary": [],
+        "quiz": [],
+        "error_message": "",
+        "stale_reason": "",
+        "updated_at": "",
+    }
+
+
+def normalize_practice_state(raw_state: Any) -> dict[str, Any]:
+    state = default_practice_state()
+    if isinstance(raw_state, dict):
+        try:
+            practice_round = int(raw_state.get("practice_round") or state["practice_round"] or 0)
+        except (TypeError, ValueError):
+            practice_round = state["practice_round"]
+        state.update({
+            "status": str(raw_state.get("status") or state["status"]),
+            "stage": str(raw_state.get("stage") or state["stage"]),
+            "error_message": str(raw_state.get("error_message") or state["error_message"]),
+            "stale_reason": str(raw_state.get("stale_reason") or state["stale_reason"]),
+            "updated_at": str(raw_state.get("updated_at") or state["updated_at"]),
+            "practice_round": practice_round,
+            "round_submitted": bool(raw_state.get("round_submitted", state["round_submitted"])),
+            "practice_completed": bool(raw_state.get("practice_completed", state["practice_completed"])),
+        })
+        weak_subtopics = raw_state.get("weak_subtopics")
+        if isinstance(weak_subtopics, list):
+            state["weak_subtopics"] = [str(item).strip() for item in weak_subtopics if str(item).strip()]
+        current_weak_subtopics = raw_state.get("current_weak_subtopics")
+        if isinstance(current_weak_subtopics, list):
+            state["current_weak_subtopics"] = [str(item).strip() for item in current_weak_subtopics if str(item).strip()]
+        pending_weak_subtopics = raw_state.get("pending_weak_subtopics")
+        if isinstance(pending_weak_subtopics, list):
+            state["pending_weak_subtopics"] = [str(item).strip() for item in pending_weak_subtopics if str(item).strip()]
+        mastery = raw_state.get("mastery")
+        if isinstance(mastery, dict):
+            state["mastery"] = normalize_mastery_map(mastery)
+        elif isinstance(mastery, list):
+            state["mastery"] = normalize_mastery_map(mastery)
+        mastery_order = raw_state.get("mastery_order")
+        if isinstance(mastery_order, list):
+            state["mastery_order"] = [str(item).strip() for item in mastery_order if str(item).strip()]
+        request = raw_state.get("request")
+        if isinstance(request, dict):
+            state["request"] = request
+        summary = raw_state.get("summary")
+        if isinstance(summary, list):
+            state["summary"] = summary
+        quiz = raw_state.get("quiz")
+        if isinstance(quiz, list):
+            state["quiz"] = quiz
+    return state
+
+
+def normalize_mastery_map(raw_mastery: Any) -> dict[str, int]:
+    mastery: dict[str, int] = {}
+    items: list[tuple[str, Any]] = []
+    if isinstance(raw_mastery, dict):
+        items = [(str(key), value) for key, value in raw_mastery.items()]
+    elif isinstance(raw_mastery, list):
+        for item in raw_mastery:
+            if not isinstance(item, dict):
+                continue
+            subtopic = str(item.get("subtopic") or "").strip()
+            if not subtopic:
+                continue
+            items.append((subtopic, item.get("percent", 0)))
+    for subtopic_raw, percent_raw in items:
+        subtopic = str(subtopic_raw or "").strip()
+        if not subtopic:
+            continue
+        try:
+            percent = int(percent_raw or 0)
+        except (TypeError, ValueError):
+            percent = 0
+        mastery[subtopic] = max(0, min(100, percent))
+    return mastery
+
+
+def practice_mastery_order(practice: dict[str, Any], fallback_order: list[str] | None = None) -> list[str]:
+    order: list[str] = []
+    seen: set[str] = set()
+    raw_order = practice.get("mastery_order")
+    if isinstance(raw_order, list):
+        for item in raw_order:
+            subtopic = str(item or "").strip()
+            if not subtopic or subtopic in seen:
+                continue
+            order.append(subtopic)
+            seen.add(subtopic)
+    if fallback_order:
+        for item in fallback_order:
+            subtopic = str(item or "").strip()
+            if not subtopic or subtopic in seen:
+                continue
+            order.append(subtopic)
+            seen.add(subtopic)
+    mastery = normalize_mastery_map(practice.get("mastery", {}))
+    for subtopic in mastery.keys():
+        if subtopic not in seen:
+            order.append(subtopic)
+            seen.add(subtopic)
+    return order
+
+
+def practice_low_topics(mastery: dict[str, int], order: list[str]) -> list[dict[str, Any]]:
+    order_map = {subtopic: idx for idx, subtopic in enumerate(order)}
+    low_topics = [
+        {"subtopic": subtopic, "percent": int(percent or 0)}
+        for subtopic, percent in mastery.items()
+        if int(percent or 0) < 80
+    ]
+    low_topics.sort(
+        key=lambda item: (
+            int(item.get("percent", 0) or 0),
+            order_map.get(str(item.get("subtopic") or ""), len(order_map)),
+            str(item.get("subtopic") or "").casefold(),
+        )
+    )
+    return low_topics
+
+
+def practice_round_topics(mastery: dict[str, int], order: list[str], limit: int = 2) -> tuple[list[str], list[str]]:
+    low_topics = practice_low_topics(mastery, order)
+    selected = [str(item.get("subtopic") or "").strip() for item in low_topics[:limit] if str(item.get("subtopic") or "").strip()]
+    pending = [str(item.get("subtopic") or "").strip() for item in low_topics[limit:] if str(item.get("subtopic") or "").strip()]
+    return selected, pending
+
+
+def merge_practice_mastery(practice: dict[str, Any], round_mastery: list[dict[str, Any]], fallback_order: list[str] | None = None) -> dict[str, Any]:
+    mastery = normalize_mastery_map(practice.get("mastery", {}))
+    for item in round_mastery:
+        if not isinstance(item, dict):
+            continue
+        subtopic = str(item.get("subtopic") or "").strip()
+        if not subtopic:
+            continue
+        try:
+            percent = int(item.get("percent", 0) or 0)
+        except (TypeError, ValueError):
+            percent = 0
+        mastery[subtopic] = max(0, min(100, percent))
+
+    order = practice_mastery_order(practice, fallback_order)
+    for subtopic in mastery.keys():
+        if subtopic not in order:
+            order.append(subtopic)
+
+    updated = {**practice, "mastery": mastery, "mastery_order": order}
+    return updated
+
+
+def practice_is_active(practice: dict[str, Any]) -> bool:
+    return str(practice.get("status") or "").strip().casefold() in {
+        "processing_summary",
+        "summary_ready",
+        "processing_quiz",
+        "completed",
+        "failed",
+    }
+
+
+def practice_state_from_patch(current_practice: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    practice = normalize_practice_state(current_practice)
+    practice.update(patch)
+    practice["updated_at"] = now_iso()
+    return practice
+
+
+def invalidate_practice_state(reason: str) -> dict[str, Any]:
+    state = default_practice_state()
+    state["status"] = "stale"
+    state["stale_reason"] = reason
+    state["updated_at"] = now_iso()
+    return state
+
+
+def normalize_text_for_match(text: str) -> str:
+    return re.sub(r"[^0-9a-zA-Zа-яА-ЯёЁ]+", " ", str(text or "").casefold()).strip()
+
+
+def split_text_tokens(text: str) -> set[str]:
+    tokens = {
+        token
+        for token in re.split(r"[^0-9a-zA-Zа-яА-ЯёЁ]+", normalize_text_for_match(text))
+        if len(token) >= 4
+    }
+    return tokens
+
+
+def select_practice_mini_summaries(generation: dict[str, Any], weak_subtopics: list[str]) -> list[dict[str, Any]]:
+    mini_summaries = generation.get("mini_summary", [])
+    summary_sections = generation.get("summary", [])
+    if not isinstance(mini_summaries, list):
+        mini_summaries = []
+    if not isinstance(summary_sections, list):
+        summary_sections = []
+
+    summary_map: dict[str, dict[str, Any]] = {}
+    for idx, section in enumerate(summary_sections):
+        if not isinstance(section, dict):
+            continue
+        subtopic = str(section.get("subtopic") or f"Раздел {idx + 1}").strip()
+        if subtopic:
+            summary_map[normalize_text_for_match(subtopic)] = section
+
+    selected: list[dict[str, Any]] = []
+    seen_chunks: set[int] = set()
+
+    def add_chunk(item: dict[str, Any]) -> None:
+        try:
+            chunk_id = int(item.get("chunk_id", 0) or 0)
+        except (TypeError, ValueError):
+            chunk_id = 0
+        if chunk_id in seen_chunks:
+            return
+        seen_chunks.add(chunk_id)
+        selected.append(item)
+
+    for weak_subtopic in weak_subtopics:
+        normalized_weak = normalize_text_for_match(weak_subtopic)
+        if not normalized_weak:
+            continue
+        matched_section = summary_map.get(normalized_weak)
+        matched_tokens = split_text_tokens(matched_section.get("content", "")) if isinstance(matched_section, dict) else set()
+        if not matched_tokens:
+            matched_tokens = split_text_tokens(weak_subtopic)
+
+        for item in mini_summaries:
+            if not isinstance(item, dict):
+                continue
+            blob_parts: list[str] = []
+            for field in ("key_points", "terms", "examples"):
+                value = item.get(field)
+                if isinstance(value, list):
+                    blob_parts.extend(str(part) for part in value if str(part).strip())
+            blob = normalize_text_for_match(" ".join(blob_parts))
+            if normalized_weak in blob or any(token in blob for token in matched_tokens):
+                add_chunk(item)
+
+    if not selected and isinstance(mini_summaries, list):
+        for item in mini_summaries[:4]:
+            if isinstance(item, dict):
+                add_chunk(item)
+
+    return selected
+
+
+def build_practice_questions(generation: dict[str, Any], questions: list[dict[str, Any]], weak_subtopics: list[str]) -> list[dict[str, Any]]:
+    quiz = generation.get("quiz", [])
+    if not isinstance(quiz, list):
+        quiz = []
+    allowed = {normalize_text_for_match(item) for item in weak_subtopics if normalize_text_for_match(item)}
+    normalized_questions: list[dict[str, Any]] = []
+
+    quiz_by_id: dict[str, dict[str, Any]] = {}
+    for idx, q in enumerate(quiz):
+        if not isinstance(q, dict):
+            continue
+        qid = str(q.get("question_id", idx + 1))
+        quiz_by_id[qid] = q
+
+    for item in questions:
+        if not isinstance(item, dict):
+            continue
+        subtopic = str(item.get("subtopic") or "").strip()
+        if allowed and normalize_text_for_match(subtopic) not in allowed:
+            continue
+        qid = str(item.get("question_id") or "").strip()
+        source_q = quiz_by_id.get(qid)
+        source_question_type = str(source_q.get("question_type") if isinstance(source_q, dict) else "multiple_choice")
+        source_question_text = str(source_q.get("question_text") if isinstance(source_q, dict) else "")
+        source_explanation = str(source_q.get("explanation") if isinstance(source_q, dict) else "")
+        normalized_questions.append(
+            {
+                "question_id": qid,
+                "question_type": str(item.get("question_type") or source_question_type or "multiple_choice"),
+                "subtopic": subtopic,
+                "question_text": str(item.get("question_text") or source_question_text).strip(),
+                "student_answer": str(item.get("student_answer") or "").strip(),
+                "correct_answer": str(item.get("correct_answer") or "").strip(),
+                "is_correct": bool(item.get("is_correct")),
+                "explanation": str(item.get("explanation") or source_explanation).strip(),
+            }
+        )
+
+    if not normalized_questions and questions:
+        for item in questions:
+            if not isinstance(item, dict):
+                continue
+            subtopic = str(item.get("subtopic") or "").strip()
+            qid = str(item.get("question_id") or "").strip()
+            source_q = quiz_by_id.get(qid)
+            source_question_type = str(source_q.get("question_type") if isinstance(source_q, dict) else "multiple_choice")
+            source_question_text = str(source_q.get("question_text") if isinstance(source_q, dict) else "")
+            source_explanation = str(source_q.get("explanation") if isinstance(source_q, dict) else "")
+            normalized_questions.append(
+                {
+                    "question_id": qid,
+                    "question_type": str(item.get("question_type") or source_question_type or "multiple_choice"),
+                    "subtopic": subtopic,
+                    "question_text": str(item.get("question_text") or source_question_text).strip(),
+                    "student_answer": str(item.get("student_answer") or "").strip(),
+                    "correct_answer": str(item.get("correct_answer") or "").strip(),
+                    "is_correct": bool(item.get("is_correct")),
+                    "explanation": str(item.get("explanation") or source_explanation).strip(),
+                }
+            )
+
+    return normalized_questions
+
+
+def fallback_practice_questions_from_quiz(generation: dict[str, Any], weak_subtopics: list[str]) -> list[dict[str, Any]]:
+    quiz = generation.get("quiz", [])
+    if not isinstance(quiz, list):
+        quiz = []
+    allowed = {normalize_text_for_match(item) for item in weak_subtopics if normalize_text_for_match(item)}
+    questions: list[dict[str, Any]] = []
+    for idx, q in enumerate(quiz):
+        if not isinstance(q, dict):
+            continue
+        subtopic = str(q.get("subtopic") or f"Подтема {idx + 1}").strip()
+        normalized_subtopic = normalize_text_for_match(subtopic)
+        if allowed and normalized_subtopic not in allowed:
+            continue
+        questions.append(
+            {
+                "question_id": str(q.get("question_id") or idx + 1),
+                "question_type": str(q.get("question_type") or "multiple_choice"),
+                "subtopic": subtopic,
+                "question_text": str(q.get("question_text") or "").strip(),
+                "student_answer": "",
+                "correct_answer": str(q.get("correct_answer") or "").strip(),
+                "is_correct": False,
+                "explanation": str(q.get("explanation") or "").strip(),
+            }
+        )
+    if not questions:
+        for idx, q in enumerate(quiz):
+            if not isinstance(q, dict):
+                continue
+            questions.append(
+                {
+                    "question_id": str(q.get("question_id") or idx + 1),
+                    "question_type": str(q.get("question_type") or "multiple_choice"),
+                    "subtopic": str(q.get("subtopic") or f"Подтема {idx + 1}").strip(),
+                    "question_text": str(q.get("question_text") or "").strip(),
+                    "student_answer": "",
+                    "correct_answer": str(q.get("correct_answer") or "").strip(),
+                    "is_correct": False,
+                    "explanation": str(q.get("explanation") or "").strip(),
+                }
+            )
+    return questions
+
+
+def build_practice_payload(generation: dict[str, Any], weak_subtopics: list[str], questions: list[dict[str, Any]]) -> dict[str, Any]:
+    topics = []
+    selected_mini_summaries = select_practice_mini_summaries(generation, weak_subtopics)
+    summary_sections = generation.get("summary", [])
+    summary_lookup: dict[str, dict[str, Any]] = {}
+    if isinstance(summary_sections, list):
+        for idx, section in enumerate(summary_sections):
+            if not isinstance(section, dict):
+                continue
+            subtopic = str(section.get("subtopic") or f"Раздел {idx + 1}").strip()
+            if subtopic:
+                summary_lookup[normalize_text_for_match(subtopic)] = section
+
+    for weak_subtopic in weak_subtopics:
+        normalized_weak = normalize_text_for_match(weak_subtopic)
+        section = summary_lookup.get(normalized_weak)
+        topic_mini_summaries = select_practice_mini_summaries(
+            generation,
+            [weak_subtopic],
+        )
+        topics.append(
+            {
+                "subtopic": weak_subtopic,
+                "summary_section": section if isinstance(section, dict) else None,
+                "mini_summaries": topic_mini_summaries,
+            }
+        )
+
+    if not topics and selected_mini_summaries:
+        topics.append(
+            {
+                "subtopic": "Повторение ключевых моментов",
+                "summary_section": None,
+                "mini_summaries": selected_mini_summaries,
+            }
+        )
+
+    return {
+        "weak_subtopics": weak_subtopics,
+        "topics": topics,
+        "questions": questions,
+    }
+
+
+async def grade_quiz_attempt(generation: dict[str, Any], quiz: list[dict[str, Any]], answers: list[dict[str, Any]]) -> dict[str, Any]:
+    quiz_subtopics_list = quiz_subtopics(quiz)
+    answers_by_id: dict[str, dict[str, Any]] = {}
+    for item in answers:
+        if not isinstance(item, dict):
+            continue
+        qid = str(item.get("question_id", "")).strip()
+        if qid:
+            answers_by_id[qid] = item
+
+    results: list[dict[str, Any]] = []
+    open_payload: list[dict[str, Any]] = []
+    open_subtopics_by_id: dict[str, str] = {}
+    for idx, q in enumerate(quiz):
+        if not isinstance(q, dict):
+            continue
+        qid = str(q.get("question_id", idx + 1))
+        qtype = q.get("question_type", "multiple_choice")
+        subtopic = (q.get("subtopic") or f"Подтема {idx + 1}").strip()
+        user_answer = answers_by_id.get(qid, {})
+        if not isinstance(user_answer, dict):
+            user_answer = {"answer": user_answer}
+        if qtype in ("open_ended", "open_question"):
+            open_subtopics_by_id[qid] = subtopic
+            open_payload.append(
+                {
+                    "question_id": qid,
+                    "question_text": q.get("question_text", ""),
+                    "correct_answer": q.get("correct_answer", ""),
+                    "student_answer": user_answer.get("student_answer") if isinstance(user_answer.get("student_answer"), str) else str(user_answer.get("answer") or ""),
+                }
+            )
+            continue
+
+        if "is_correct" in user_answer:
+            score = 1 if user_answer.get("is_correct") is True else 0
+        else:
+            try:
+                ua = int(user_answer.get("answer"))
+            except (TypeError, ValueError):
+                ua = -1
+            try:
+                correct_answer = int(q.get("correct_answer", -999))
+            except (TypeError, ValueError):
+                correct_answer = -999
+            score = 1 if ua == correct_answer else 0
+        results.append({"question_id": qid, "subtopic": subtopic, "score": score})
+
+    if open_payload:
+        if not ML_API_KEY:
+            raise HTTPException(status_code=500, detail="Сервис проверки не настроен.")
+        ml_client = MLServiceClient(api_key=ML_API_KEY, base_url=ML_URL)
+        try:
+            graded = await ml_client.grade_open_answers(open_payload)
+            for row in graded.get("scores", []):
+                qid = str(row.get("question_id", ""))
+                results.append(
+                    {
+                        "question_id": qid,
+                        "subtopic": open_subtopics_by_id.get(qid, ""),
+                        "score": int(row.get("score", 0)),
+                    }
+                )
+        except MLServiceError as exc:
+            raise HTTPException(status_code=500, detail=exc.user_message)
+
+    mastery = build_mastery_from_results(results, quiz_subtopics_list)
+    recommendations = build_recommendations_from_mastery(mastery)
+    recommendation = summarize_recommendations(recommendations)
+    subtopic_to_revise = choose_subtopic_to_revise(recommendations)
+    return {
+        "results": results,
+        "mastery": mastery,
+        "recommendations": recommendations,
+        "recommendation": recommendation,
+        "subtopic_to_revise": subtopic_to_revise,
+    }
+
+
+def update_practice_state(generation_id: str, patch: dict[str, Any]) -> None:
+    current = get_generation(generation_id)
+    if not current:
+        return
+    practice = normalize_practice_state(current.get("practice", {}))
+    practice.update(patch)
+    practice["updated_at"] = now_iso()
+    update_generation(generation_id, {"practice": practice})
+
+
+def seed_practice_mastery(practice: dict[str, Any], payload_mastery: Any, generation: dict[str, Any]) -> dict[str, Any]:
+    current = normalize_practice_state(practice)
+    mastery = normalize_mastery_map(current.get("mastery", {}))
+    payload_mastery_map = normalize_mastery_map(payload_mastery)
+    if payload_mastery_map:
+        for subtopic, percent in payload_mastery_map.items():
+            mastery.setdefault(subtopic, percent)
+    if not mastery:
+        analytics = generation.get("analytics", {})
+        if isinstance(analytics, dict):
+            mastery = normalize_mastery_map(analytics.get("mastery", []))
+    if mastery:
+        order = practice_mastery_order(current, [str(item) for item in quiz_subtopics(generation.get("quiz", []))])
+        for subtopic in mastery.keys():
+            if subtopic not in order:
+                order.append(subtopic)
+        current["mastery"] = mastery
+        current["mastery_order"] = order
+    return current
+
+
+def practice_completion_view(practice: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "practice": normalize_practice_state(practice),
+        "next_action": "done"
+        if bool(practice.get("practice_completed"))
+        else ("continue" if practice.get("round_submitted") and practice.get("pending_weak_subtopics") else "start"),
+    }
+
+
+def practice_round_context(practice: dict[str, Any], generation: dict[str, Any], payload_mastery: Any = None) -> tuple[dict[str, Any], list[str], list[str], bool]:
+    current = seed_practice_mastery(practice, payload_mastery, generation)
+    mastery = normalize_mastery_map(current.get("mastery", {}))
+    order = practice_mastery_order(current, [str(item) for item in quiz_subtopics(generation.get("quiz", []))])
+    low_topics = practice_low_topics(mastery, order)
+    selected = [str(item.get("subtopic") or "").strip() for item in low_topics[:2] if str(item.get("subtopic") or "").strip()]
+    pending = [str(item.get("subtopic") or "").strip() for item in low_topics[2:] if str(item.get("subtopic") or "").strip()]
+    all_done = not selected
+    if selected:
+        current["practice_round"] = int(current.get("practice_round") or 0) + 1
+        current["current_weak_subtopics"] = selected
+        current["pending_weak_subtopics"] = pending
+        current["weak_subtopics"] = selected
+        current["round_submitted"] = False
+        current["practice_completed"] = False
+    else:
+        current["current_weak_subtopics"] = []
+        current["pending_weak_subtopics"] = []
+        current["weak_subtopics"] = []
+        current["round_submitted"] = True
+        current["practice_completed"] = True
+        current["status"] = "completed"
+        current["stage"] = "quiz"
+        current["summary"] = []
+        current["quiz"] = []
+    current["mastery"] = mastery
+    current["mastery_order"] = order
+    current["updated_at"] = now_iso()
+    return current, selected, pending, all_done
+
+
 def update_generation(generation_id: str, patch: dict[str, Any], broadcast_event_type: str = "generation_updated") -> None:
     current = get_generation(generation_id)
     if not current:
         return
     merged = {**current, **patch}
+    if ("summary" in patch or "quiz" in patch) and "practice" not in patch:
+        current_practice = normalize_practice_state(current.get("practice", {}))
+        if practice_is_active(current_practice):
+            merged["practice"] = invalidate_practice_state("Практика устарела после изменения конспекта или теста.")
     conn = db_conn()
     conn.execute(
         """
         UPDATE generations
-        SET status = ?, progress_percent = ?, transcript_json = ?, summary_json = ?, quiz_json = ?, analytics_json = ?, error_message = ?
+        SET status = ?, progress_percent = ?, transcript_json = ?, mini_summary_json = ?, summary_json = ?, quiz_json = ?, practice_json = ?, analytics_json = ?, error_message = ?
         WHERE id = ?
         """,
         (
             merged["status"],
             float(merged.get("progress_percent", 0) or 0),
             json.dumps(merged.get("transcript", []), ensure_ascii=False),
+            json.dumps(merged.get("mini_summary", []), ensure_ascii=False),
             json.dumps(merged.get("summary", []), ensure_ascii=False),
             json.dumps(merged.get("quiz", []), ensure_ascii=False),
+            json.dumps(normalize_practice_state(merged.get("practice", {})), ensure_ascii=False),
             json.dumps(merged.get("analytics", {}), ensure_ascii=False),
             merged.get("error_message", ""),
             generation_id,
@@ -808,6 +1395,7 @@ def load_student_attempt(generation_id: str, user_id: str) -> Optional[dict[str,
     if not attempt_row:
         return None
     return {
+        "answers": json.loads(attempt_row["answers_json"]) if attempt_row["answers_json"] else [],
         "results": json.loads(attempt_row["results_json"]) if attempt_row["results_json"] else [],
         "mastery": json.loads(attempt_row["mastery_json"]) if attempt_row["mastery_json"] else [],
         "recommendation": attempt_row["recommendation"] or "",
@@ -1181,7 +1769,7 @@ async def transcribe_audio_chunks(
 async def build_summary_and_quiz(
     ml_client: MLServiceClient,
     transcript_chunks: list[dict[str, Any]],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     summary_groups = transcript_to_summary_groups([chunk["transcript_chunk"] for chunk in transcript_chunks])
     log_summary_payload(summary_groups, "build_summary_and_quiz")
     mini_summaries = await asyncio.gather(*(ml_client.make_mini_summary(chunk) for chunk in summary_groups))
@@ -1192,7 +1780,7 @@ async def build_summary_and_quiz(
     for chunk in transcript_chunks:
         transcript.extend(chunk["phrases"])
     transcript.sort(key=lambda item: (int(item.get("start_ms", 0) or 0), int(item.get("chunk_id", 0) or 0)))
-    return transcript, summary, quiz
+    return transcript, list(mini_summaries), summary, quiz
 
 
 async def run_ml_retry_pipeline(generation_id: str) -> None:
@@ -1216,6 +1804,7 @@ async def run_ml_retry_pipeline(generation_id: str) -> None:
                 )
             log_summary_payload(summary_groups, "run_ml_retry_pipeline")
             mini_summaries = await asyncio.gather(*(ml_client.make_mini_summary(chunk) for chunk in summary_groups))
+            update_generation(generation_id, {"mini_summary": list(mini_summaries)})
             summary = await ml_client.make_lesson_summary(mini_summaries)
             log_final_summary(summary, "run_ml_retry_pipeline")
             update_generation(generation_id, {"summary": summary})
@@ -1237,6 +1826,7 @@ async def finalize_generation_from_transcript(generation_id: str, transcript: li
             {
                 "status": "processing",
                 "progress_percent": 100,
+                "mini_summary": [],
                 "transcript": transcript,
                 "summary": [],
                 "quiz": [],
@@ -1253,6 +1843,7 @@ async def finalize_generation_from_transcript(generation_id: str, transcript: li
 
         log_summary_payload(summary_groups, "finalize_generation_from_transcript")
         mini_summaries = await asyncio.gather(*(ml_client.make_mini_summary(chunk) for chunk in summary_groups))
+        update_generation(generation_id, {"mini_summary": list(mini_summaries)})
         summary = await ml_client.make_lesson_summary(mini_summaries)
         log_final_summary(summary, "finalize_generation_from_transcript")
         quiz = shuffle_quiz_options(await ml_client.make_quiz(summary))
@@ -1276,7 +1867,19 @@ async def finalize_generation_from_transcript(generation_id: str, transcript: li
 
 async def run_generation_pipeline(generation_id: str, file_bytes: bytes, file_name: str, content_type: Optional[str], content_hash: Optional[str] = None) -> None:
     try:
-        update_generation(generation_id, {"status": "processing", "progress_percent": 0, "transcript": [], "summary": [], "quiz": [], "analytics": {}, "error_message": ""})
+        update_generation(
+            generation_id,
+            {
+                "status": "processing",
+                "progress_percent": 0,
+                "transcript": [],
+                "mini_summary": [],
+                "summary": [],
+                "quiz": [],
+                "analytics": {},
+                "error_message": "",
+            },
+        )
         if not ML_API_KEY:
             raise RuntimeError("ML_API_KEY is empty")
         ml_client = MLServiceClient(api_key=ML_API_KEY, base_url=ML_URL)
@@ -1286,7 +1889,7 @@ async def run_generation_pipeline(generation_id: str, file_bytes: bytes, file_na
         if content_hash:
             store_cached_transcript(content_hash, transcript_from_transcription_results(transcription_results))
 
-        transcript, summary, quiz = await build_summary_and_quiz(ml_client, transcription_results)
+        transcript, mini_summaries, summary, quiz = await build_summary_and_quiz(ml_client, transcription_results)
 
         update_generation(
             generation_id,
@@ -1294,6 +1897,7 @@ async def run_generation_pipeline(generation_id: str, file_bytes: bytes, file_na
                 "status": "completed",
                 "progress_percent": 100,
                 "transcript": transcript,
+                "mini_summary": mini_summaries,
                 "summary": summary,
                 "quiz": quiz,
                 "analytics": build_analytics(generation_id, quiz),
@@ -1336,10 +1940,10 @@ async def api_generations_upload(request: Request, background_tasks: BackgroundT
         conn.execute(
             """
             INSERT INTO generations
-            (id, user_id, creator_id, file_name, status, created_at, transcript_json, summary_json, quiz_json, analytics_json)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            (id, user_id, creator_id, file_name, status, created_at, transcript_json, mini_summary_json, summary_json, quiz_json, practice_json, analytics_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            (generation_id, user_id, user_id, safe_file_name, "processing", now_iso(), "[]", "[]", "[]", "{}"),
+            (generation_id, user_id, user_id, safe_file_name, "processing", now_iso(), "[]", "[]", "[]", "[]", "{}", "{}"),
         )
         conn.commit()
         conn.close()
@@ -1425,8 +2029,324 @@ async def api_student(request: Request, generation_id: str):
     return {
         "summary": generation.get("summary", []),
         "quiz": generation.get("quiz", []),
+        "practice": generation.get("practice", default_practice_state()),
         "generation_id": generation_id,
         "attempt": attempt,
+    }
+
+
+@app.post("/api/student/{generation_id}/practice")
+async def api_student_practice(request: Request, generation_id: str, payload: dict[str, Any]):
+    ensure_guest_user(request)
+    generation = get_generation(generation_id)
+    if not generation or generation.get("status") != "completed":
+        raise HTTPException(status_code=404, detail="Материал недоступен.")
+    payload = payload if isinstance(payload, dict) else {}
+    questions = payload.get("questions", [])
+    if questions is not None and not isinstance(questions, list):
+        raise HTTPException(status_code=400, detail="Некорректный формат вопросов.")
+
+    current_practice = normalize_practice_state(generation.get("practice", {}))
+    current_practice = seed_practice_mastery(current_practice, payload.get("mastery"), generation)
+    if current_practice.get("practice_completed") and not current_practice.get("pending_weak_subtopics"):
+        return practice_completion_view(current_practice)
+
+    has_active_round = bool(current_practice.get("summary")) and not bool(current_practice.get("round_submitted"))
+    if has_active_round and current_practice.get("status") in {"summary_ready", "processing_quiz", "completed"}:
+        return practice_completion_view(current_practice)
+
+    weak_subtopics = payload.get("weak_subtopics", [])
+    if weak_subtopics is not None and not isinstance(weak_subtopics, list):
+        raise HTTPException(status_code=400, detail="Нет слабых подтем для практики.")
+
+    current_practice, selected_weak_subtopics, pending_weak_subtopics, all_done = practice_round_context(
+        current_practice,
+        generation,
+        payload.get("mastery"),
+    )
+    practice_questions = build_practice_questions(
+        generation,
+        questions if isinstance(questions, list) else [],
+        selected_weak_subtopics,
+    )
+    if not practice_questions:
+        practice_questions = fallback_practice_questions_from_quiz(generation, selected_weak_subtopics)
+        print(
+            "[practice] fallback_questions",
+            {
+                "generation_id": generation_id,
+                "questions_count": len(practice_questions),
+                "used_selected_topics": bool(selected_weak_subtopics),
+            },
+        )
+
+    print(
+        "[practice] request",
+        {
+            "generation_id": generation_id,
+            "weak_subtopics": current_practice.get("weak_subtopics", []),
+            "selected_weak_subtopics": selected_weak_subtopics,
+            "pending_weak_subtopics": pending_weak_subtopics,
+            "questions_count": len(practice_questions),
+            "all_done": all_done,
+            "practice_round": int(current_practice.get("practice_round") or 0),
+            "has_mastery": bool(current_practice.get("mastery")),
+        },
+    )
+
+    if all_done:
+        update_practice_state(
+            generation_id,
+            {
+                "status": "completed",
+                "stage": "quiz",
+                "weak_subtopics": [],
+                "current_weak_subtopics": [],
+                "pending_weak_subtopics": [],
+                "practice_round": int(current_practice.get("practice_round") or 0),
+                "round_submitted": True,
+                "practice_completed": True,
+                "request": {
+                    "weak_subtopics": [],
+                    "questions": [],
+                },
+                "summary": [],
+                "quiz": [],
+                "error_message": "",
+                "stale_reason": "",
+                "mastery": current_practice.get("mastery", {}),
+                "mastery_order": current_practice.get("mastery_order", []),
+            },
+        )
+        practice = get_generation(generation_id)
+        return practice_completion_view(practice.get("practice", default_practice_state()) if practice else default_practice_state())
+
+    practice_request = {
+        "weak_subtopics": selected_weak_subtopics,
+        "questions": practice_questions,
+        "mastery": current_practice.get("mastery", {}),
+    }
+    practice_context = build_practice_payload(generation, selected_weak_subtopics, practice_questions)
+    print(
+        "[practice] payload",
+        {
+            "weak_subtopics": practice_request["weak_subtopics"],
+            "topics": practice_context.get("topics", []),
+            "questions": practice_context.get("questions", []),
+        },
+    )
+    update_practice_state(
+        generation_id,
+        {
+            "status": "processing_summary",
+            "stage": "summary",
+            "weak_subtopics": selected_weak_subtopics,
+            "current_weak_subtopics": selected_weak_subtopics,
+            "pending_weak_subtopics": pending_weak_subtopics,
+            "practice_round": int(current_practice.get("practice_round") or 0),
+            "round_submitted": False,
+            "practice_completed": False,
+            "request": practice_request,
+            "summary": [],
+            "quiz": [],
+            "error_message": "",
+            "stale_reason": "",
+            "mastery": current_practice.get("mastery", {}),
+            "mastery_order": current_practice.get("mastery_order", []),
+        },
+    )
+
+    if not ML_API_KEY:
+        raise HTTPException(status_code=500, detail="Сервис дообучения не настроен.")
+
+    ml_client = MLServiceClient(api_key=ML_API_KEY, base_url=ML_URL)
+    try:
+        practice_summary = await ml_client.make_practice_summary(practice_context)
+        print(
+            "[practice] ml response",
+            {
+                "generation_id": generation_id,
+                "summary_count": len(practice_summary) if isinstance(practice_summary, list) else None,
+                "summary_preview": practice_summary[:2] if isinstance(practice_summary, list) else practice_summary,
+            },
+        )
+        update_practice_state(
+            generation_id,
+            {
+                "status": "summary_ready",
+                "stage": "summary",
+                "weak_subtopics": selected_weak_subtopics,
+                "current_weak_subtopics": selected_weak_subtopics,
+                "pending_weak_subtopics": pending_weak_subtopics,
+                "practice_round": int(current_practice.get("practice_round") or 0),
+                "round_submitted": False,
+                "practice_completed": False,
+                "request": practice_request,
+                "summary": practice_summary,
+                "quiz": [],
+                "error_message": "",
+                "stale_reason": "",
+                "mastery": current_practice.get("mastery", {}),
+                "mastery_order": current_practice.get("mastery_order", []),
+            },
+        )
+    except MLServiceError as exc:
+        print(
+            "[practice] ml error",
+            {
+                "generation_id": generation_id,
+                "message": str(exc),
+                "user_message": exc.user_message,
+                "request": practice_context,
+            },
+        )
+        update_practice_state(
+            generation_id,
+            {
+                "status": "failed",
+                "stage": "summary",
+                "weak_subtopics": selected_weak_subtopics,
+                "current_weak_subtopics": selected_weak_subtopics,
+                "pending_weak_subtopics": pending_weak_subtopics,
+                "practice_round": int(current_practice.get("practice_round") or 0),
+                "round_submitted": False,
+                "practice_completed": False,
+                "request": practice_request,
+                "summary": [],
+                "quiz": [],
+                "error_message": exc.user_message,
+                "stale_reason": "",
+                "mastery": current_practice.get("mastery", {}),
+                "mastery_order": current_practice.get("mastery_order", []),
+            },
+        )
+        raise HTTPException(status_code=500, detail=exc.user_message)
+
+    practice = get_generation(generation_id)
+    return practice_completion_view(practice.get("practice", default_practice_state()) if practice else default_practice_state())
+
+
+@app.post("/api/student/{generation_id}/practice/quiz")
+async def api_student_practice_quiz(request: Request, generation_id: str):
+    ensure_guest_user(request)
+    generation = get_generation(generation_id)
+    if not generation or generation.get("status") != "completed":
+        raise HTTPException(status_code=404, detail="Материал недоступен.")
+
+    practice = normalize_practice_state(generation.get("practice", {}))
+    if practice.get("status") == "completed" and isinstance(practice.get("quiz"), list) and practice.get("quiz"):
+        return {"practice": practice}
+    if practice.get("status") not in {"summary_ready", "failed", "processing_quiz"} or not isinstance(practice.get("summary"), list) or not practice.get("summary"):
+        raise HTTPException(status_code=400, detail="Сначала нужно сгенерировать практический конспект.")
+
+    if not ML_API_KEY:
+        raise HTTPException(status_code=500, detail="Сервис дообучения не настроен.")
+
+    update_practice_state(
+        generation_id,
+        {
+            "status": "processing_quiz",
+            "stage": "quiz",
+            "error_message": "",
+            "stale_reason": "",
+        },
+    )
+    ml_client = MLServiceClient(api_key=ML_API_KEY, base_url=ML_URL)
+    try:
+        practice_quiz = shuffle_quiz_options(await ml_client.make_quiz(practice["summary"]))
+        update_practice_state(
+            generation_id,
+            {
+                "status": "completed",
+                "stage": "quiz",
+                "summary": practice["summary"],
+                "quiz": practice_quiz,
+                "weak_subtopics": practice.get("weak_subtopics", []),
+                "request": practice.get("request", {}),
+                "error_message": "",
+                "stale_reason": "",
+            },
+        )
+    except MLServiceError as exc:
+        update_practice_state(
+            generation_id,
+            {
+                "status": "failed",
+                "stage": "quiz",
+                "summary": practice["summary"],
+                "quiz": [],
+                "weak_subtopics": practice.get("weak_subtopics", []),
+                "request": practice.get("request", {}),
+                "error_message": exc.user_message,
+                "stale_reason": "",
+            },
+        )
+        raise HTTPException(status_code=500, detail=exc.user_message)
+
+    practice = get_generation(generation_id)
+    return {"practice": practice.get("practice", default_practice_state()) if practice else default_practice_state()}
+
+
+@app.post("/api/student/{generation_id}/practice/complete")
+async def api_student_practice_complete(request: Request, generation_id: str, payload: dict[str, Any]):
+    ensure_guest_user(request)
+    generation = get_generation(generation_id)
+    if not generation or generation.get("status") != "completed":
+        raise HTTPException(status_code=404, detail="Материал недоступен.")
+
+    practice = normalize_practice_state(generation.get("practice", {}))
+    if not isinstance(practice.get("quiz"), list) or not practice.get("quiz"):
+        raise HTTPException(status_code=400, detail="Сначала нужно сгенерировать практический тест.")
+
+    answers = payload.get("answers", []) if isinstance(payload, dict) else []
+    if not isinstance(answers, list):
+        raise HTTPException(status_code=400, detail="Некорректный формат ответов.")
+
+    graded = await grade_quiz_attempt(generation, practice.get("quiz", []), answers)
+    current_mastery = normalize_mastery_map(practice.get("mastery", {}))
+    current_mastery = {**current_mastery}
+    round_subtopics = quiz_subtopics(practice.get("quiz", []))
+    round_mastery = build_mastery_from_results(graded["results"], round_subtopics)
+    for item in round_mastery:
+        subtopic = str(item.get("subtopic") or "").strip()
+        if not subtopic:
+            continue
+        try:
+            percent = int(item.get("percent", 0) or 0)
+        except (TypeError, ValueError):
+            percent = 0
+        current_mastery[subtopic] = max(0, min(100, percent))
+
+    order = practice_mastery_order(practice, round_subtopics)
+    low_topics = practice_low_topics(current_mastery, order)
+    pending_weak_subtopics = [str(item.get("subtopic") or "").strip() for item in low_topics if str(item.get("subtopic") or "").strip()]
+    practice_completed = not pending_weak_subtopics
+    practice_patch = {
+        "status": "completed",
+        "stage": "quiz",
+        "weak_subtopics": practice.get("current_weak_subtopics", practice.get("weak_subtopics", [])),
+        "current_weak_subtopics": practice.get("current_weak_subtopics", practice.get("weak_subtopics", [])),
+        "pending_weak_subtopics": pending_weak_subtopics,
+        "practice_round": int(practice.get("practice_round") or 0),
+        "round_submitted": True,
+        "practice_completed": practice_completed,
+        "summary": practice.get("summary", []),
+        "quiz": practice.get("quiz", []),
+        "request": practice.get("request", {}),
+        "mastery": current_mastery,
+        "mastery_order": order,
+        "error_message": "",
+        "stale_reason": "",
+    }
+    update_practice_state(generation_id, practice_patch)
+    practice = get_generation(generation_id)
+    return {
+        "practice": practice.get("practice", default_practice_state()) if practice else default_practice_state(),
+        "results": graded["results"],
+        "mastery": graded["mastery"],
+        "recommendation": graded["recommendation"],
+        "subtopic_to_revise": graded["subtopic_to_revise"],
+        "recommendations": graded["recommendations"],
     }
 
 

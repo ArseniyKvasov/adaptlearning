@@ -76,7 +76,34 @@ Response:
 ### `POST /mini-summary`
 Постановка задачи на мини-конспект.
 
-Request: как и раньше.
+Request: `application/json`
+
+```json
+{
+  "chunk_id": 1,
+  "start_time": "00:00:00",
+  "end_time": "00:08:00",
+  "start_ms": 0,
+  "end_ms": 480000,
+  "transcript": [
+    {
+      "start_ms": 0,
+      "text": "..."
+    }
+  ]
+}
+```
+
+Поля:
+- `chunk_id` integer, required
+- `start_time` string, required
+- `end_time` string, required
+- `start_ms` integer, required
+- `end_ms` integer, required
+- `transcript` array, required
+- каждый элемент `transcript`:
+  - `start_ms` integer, required
+  - `text` string, required
 
 Response:
 ```json
@@ -92,7 +119,20 @@ Response:
 ### `POST /lesson-summary`
 Постановка задачи на итоговый конспект.
 
-Request: как и раньше.
+Request: `application/json`
+
+```json
+{
+  "topic_hint": "",
+  "key_points": [
+    "..."
+  ]
+}
+```
+
+Поля:
+- `topic_hint` string, optional
+- `key_points` array[string], required, не пустой
 
 Response:
 ```json
@@ -108,7 +148,28 @@ Response:
 ### `POST /quiz`
 Постановка задачи на генерацию теста.
 
-Request: как и раньше.
+Request: `application/json`
+
+```json
+{
+  "summary": [
+    {
+      "subtopic": "Тема 1",
+      "content": "..."
+    }
+  ],
+  "mcq_count": 5,
+  "open_count": 2
+}
+```
+
+Поля:
+- `summary` array, required
+- каждый элемент `summary`:
+  - `subtopic` string, required
+  - `content` string, required
+- `mcq_count` integer, optional, default `5`
+- `open_count` integer, optional, default `2`
 
 Response:
 ```json
@@ -121,10 +182,107 @@ Response:
 
 ---
 
+### `POST /practice-summary`
+Постановка задачи на адаптивный практический конспект по слабым подтемам.
+
+Request: `application/json`
+
+```json
+{
+  "weak_subtopics": [
+    "Тема 1",
+    "Тема 2"
+  ],
+  "topics": [
+    {
+      "subtopic": "Тема 1",
+      "summary_section": {
+        "subtopic": "Тема 1",
+        "content": "..."
+      },
+      "mini_summaries": [
+        {
+          "chunk_id": 1,
+          "start_time": "00:00:00",
+          "end_time": "00:08:00",
+          "transcript": [
+            {
+              "start_ms": 0,
+              "text": "..."
+            }
+          ]
+        }
+      ]
+    }
+  ],
+  "questions": [
+    {
+      "question_id": "1",
+      "question_type": "multiple_choice",
+      "subtopic": "Тема 1",
+      "question_text": "Вопрос",
+      "student_answer": "Текст ответа студента",
+      "correct_answer": "Текст правильного ответа",
+      "is_correct": false,
+      "explanation": "Пояснение"
+    }
+  ]
+}
+```
+
+Поля:
+- `weak_subtopics` array[string], required, не пустой
+- `topics` array, required
+- каждый элемент `topics`:
+  - `subtopic` string, required
+  - `summary_section` object|null, optional
+  - `mini_summaries` array, optional
+- каждый элемент `questions`:
+  - `question_id` string, required
+  - `question_type` string, required
+  - `subtopic` string, required
+  - `question_text` string, required
+  - `student_answer` string, required
+  - `correct_answer` string, required
+  - `is_correct` boolean, required
+  - `explanation` string, optional
+
+Response:
+```json
+{
+  "job_id": "a1b2c3...",
+  "task_type": "practice-summary",
+  "status": "queued"
+}
+```
+
+---
+
 ### `POST /grade-open-answers`
 Постановка задачи на проверку открытых ответов.
 
-Request: как и раньше.
+Request: `application/json`
+
+```json
+{
+  "answers": [
+    {
+      "question_id": "1",
+      "question_text": "Вопрос",
+      "student_answer": "Ответ студента",
+      "correct_answer": "Эталонный ответ"
+    }
+  ]
+}
+```
+
+Поля:
+- `answers` array, required
+- каждый элемент `answers`:
+  - `question_id` string, required
+  - `question_text` string, required
+  - `student_answer` string, required
+  - `correct_answer` string, required
 
 Response:
 ```json
@@ -168,7 +326,8 @@ Response:
 3. Для каждой группы транскрипта вызывает `POST /mini-summary` и затем опрашивает `GET /tasks/{job_id}`.
 4. После сбора всех mini-summary вызывает `POST /lesson-summary` и опрашивает задачу до готовности.
 5. Затем вызывает `POST /quiz` и опрашивает задачу до готовности.
-6. При проверке открытых ответов вызывает `POST /grade-open-answers` и опрашивает задачу до готовности.
+6. Если после теста нужны адаптивные упражнения, вызывает `POST /practice-summary` и опрашивает задачу до готовности.
+7. При проверке открытых ответов вызывает `POST /grade-open-answers` и опрашивает задачу до готовности.
 
 ## Что сервис не делает
 

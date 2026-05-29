@@ -56,6 +56,10 @@
                             <span class="tab-text">❓ Тест</span>
                             <span class="tab-loader" style="display: none;"></span>
                         </button>
+                        <button class="tab-btn" data-tab="practice" id="practiceTabBtn" hidden disabled style="opacity: 0.5;">
+                            <span class="tab-text">🧪 Практика</span>
+                            <span class="tab-loader" style="display: none;"></span>
+                        </button>
                         <button class="tab-btn" data-tab="analytics" id="analyticsTabBtn" disabled style="opacity: 0.5;">
                             <span class="tab-text">📊 Аналитика</span>
                             <span class="tab-loader" style="display: none;"></span>
@@ -85,6 +89,12 @@
                     </div>
                     <div id="quizContainer">
                         <div class="status-message">Тест появится после обработки</div>
+                    </div>
+                </div>
+
+                <div id="panelPractice" class="content-pane">
+                    <div id="practiceContainer">
+                        <div class="status-message">Практика появится после прохождения теста</div>
                     </div>
                 </div>
 
