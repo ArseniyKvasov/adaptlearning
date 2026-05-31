@@ -30,7 +30,7 @@ const practiceQuizState = {
 };
 
 function escapeHtml(str) {
-  return (str || '').replace(/[&<>"']/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
+  return String(str ?? '').replace(/[&<>"']/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
 }
 
 function protectMathSegments(text) {
@@ -332,7 +332,7 @@ function markdownInlineToHtmlQuiz(text) {
 }
 
 function formatMarkdownToHtml(text) {
-  const source = escapeHtml(normalizeTextBreaks(removePunctuationAfterBlockMath(text)));
+  const source = escapeHtml(normalizeTextBreaks(removePunctuationAfterBlockMath(text))).replace(/#/g, '');
   const protectedMath = protectMathSegments(source);
   let html = protectedMath.text;
 
@@ -343,6 +343,22 @@ function formatMarkdownToHtml(text) {
     codeParts.push({ lang: lang || 'plaintext', code });
     return token;
   });
+
+  const renderInline = (value) => {
+    let inline = String(value || '');
+    const inlineCodeParts = [];
+    inline = inline.replace(/`([^`\n]+)`/g, (_match, code) => {
+      const token = `@@INLINE_CODE_${inlineCodeParts.length}@@`;
+      inlineCodeParts.push(code);
+      return token;
+    });
+    inline = inline
+      .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+      .replace(/\*(.*?)\*/g, '<em>$1</em>')
+      .replace(/\n/g, '<br>')
+      .replace(/@@INLINE_CODE_(\d+)@@/g, (_m, idx) => `<span class="inline-code">${inlineCodeParts[Number(idx)] || ''}</span>`);
+    return inline;
+  };
 
   const blocks = html.split(/\n{2,}/).map((block) => block.trim()).filter(Boolean);
 
@@ -357,22 +373,70 @@ function formatMarkdownToHtml(text) {
       });
     }
 
-    const listMatch = block.match(/^(?:\* .+(?:\n|$))+$/);
-    if (listMatch) {
-      const items = block
-        .split('\n')
-        .map((line) => line.trim())
-        .filter((line) => line.startsWith('* '))
-        .map((line) => `<li>${line.slice(2).trim()}</li>`)
-        .join('');
-      return `<ul>${items}</ul>`;
+    const lines = block.split('\n').map((line) => line.trimEnd()).filter(Boolean);
+    const isTableDivider = (line) => {
+      const cells = line.split('|').map((cell) => cell.trim()).filter(Boolean);
+      return cells.length >= 2 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+    };
+    const isListLine = (line) => /^[\*\-\u2013\u2014] /.test(line.trim());
+    const splitRow = (line) => {
+      const rawCells = line.split('|').map((cell) => cell.trim());
+      const cells = rawCells.filter((cell, idx, arr) => !(idx === 0 && !line.startsWith('|') && cell === '') && !(idx === arr.length - 1 && !line.endsWith('|') && cell === ''));
+      while (cells.length && !cells[0]) cells.shift();
+      while (cells.length && !cells[cells.length - 1]) cells.pop();
+      return cells;
+    };
+
+    const parts = [];
+    let i = 0;
+    while (i < lines.length) {
+      const current = lines[i];
+      const next = lines[i + 1] || '';
+
+      if (current && current.includes('|') && isTableDivider(next)) {
+        const tableLines = [current, next];
+        i += 2;
+        while (i < lines.length && lines[i].includes('|')) {
+          tableLines.push(lines[i]);
+          i += 1;
+        }
+        const rows = tableLines.map((line) => splitRow(line));
+        const header = rows[0] || [];
+        const bodyRows = rows.slice(2);
+        const columnCount = Math.max(1, ...rows.map((row) => row.length));
+        const colgroup = Array.from({ length: columnCount }, () => '<col style="width:clamp(100px, 18vw, 240px);">').join('');
+        const headerHtml = header.map((cell) => `<th>${renderInline(cell)}</th>`).join('');
+        const bodyHtml = bodyRows
+          .map((row) => `<tr>${row.map((cell) => `<td>${renderInline(cell)}</td>`).join('')}${Array.from({ length: Math.max(0, columnCount - row.length) }, () => '<td></td>').join('')}</tr>`)
+          .join('');
+        parts.push(`<div class="table-wrap"><table class="markdown-table"><colgroup>${colgroup}</colgroup><thead><tr>${headerHtml}${Array.from({ length: Math.max(0, columnCount - header.length) }, () => '<th></th>').join('')}</tr></thead><tbody>${bodyHtml}</tbody></table></div>`);
+        continue;
+      }
+
+      if (isListLine(current)) {
+        const listItems = [];
+        while (i < lines.length && isListLine(lines[i])) {
+          listItems.push(`<li>${renderInline(lines[i].replace(/^[\*\-\u2013\u2014]\s+/, '').trim())}</li>`);
+          i += 1;
+        }
+        parts.push(`<ul>${listItems.join('')}</ul>`);
+        continue;
+      }
+
+      const paragraphLines = [current];
+      i += 1;
+      while (
+        i < lines.length
+        && !isListLine(lines[i])
+        && !(lines[i].includes('|') && isTableDivider(lines[i + 1] || ''))
+      ) {
+        paragraphLines.push(lines[i]);
+        i += 1;
+      }
+      parts.push(`<p>${renderInline(paragraphLines.join('<br>'))}</p>`);
     }
 
-    const content = block
-      .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-      .replace(/\*(.*?)\*/g, '<em>$1</em>')
-      .replace(/\n/g, '<br>');
-    return `<p>${content}</p>`;
+    return parts.join('');
   });
 
   return restoreMathSegments(formattedBlocks.join(''), protectedMath.mathParts);

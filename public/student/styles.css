@@ -590,6 +590,62 @@ body.drawer-open {
   margin: 0.9rem 0;
 }
 
+.table-wrap {
+  width: 100%;
+  overflow-x: auto;
+  margin: 0.75rem 0;
+  border: 1px solid #e2e8f0;
+  border-radius: 14px;
+  background: #ffffff;
+}
+
+.markdown-table {
+  width: max-content;
+  min-width: 100%;
+  border-collapse: collapse;
+  table-layout: fixed;
+  font-size: 0.82rem;
+}
+
+.markdown-table th,
+.markdown-table td {
+  min-width: 100px;
+  max-width: 240px;
+  width: clamp(100px, 18vw, 240px);
+  padding: 0.7rem 0.8rem;
+  border-bottom: 1px solid #e2e8f0;
+  border-right: 1px solid #e2e8f0;
+  vertical-align: top;
+  text-align: left;
+  line-height: 1.45;
+  word-break: break-word;
+}
+
+.markdown-table th:last-child,
+.markdown-table td:last-child {
+  border-right: 0;
+}
+
+.markdown-table thead th {
+  background: #eff6ff;
+  font-weight: 700;
+  color: #1e293b;
+}
+
+.markdown-table tbody tr:last-child td {
+  border-bottom: 0;
+}
+
+.inline-code {
+  display: inline-block;
+  padding: 0.08rem 0.42rem;
+  border-radius: 999px;
+  background: #f3e8ff;
+  color: #7c3aed;
+  font-weight: 600;
+  white-space: normal;
+}
+
 .practice-section {
   display: flex;
   flex-direction: column;

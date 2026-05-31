@@ -53,9 +53,21 @@ let wsReconnectTimer = null;
 let wsReconnectAttempt = 0;
 let transcriptJumpRaf = 0;
 let requestedGenerationCache = null;
+let activeTranscriptHighlight = {
+  generationId: '',
+  startMs: null,
+  endMs: null
+};
 
 function escapeHtml(str) {
-  return (str || '').replace(/[&<>"']/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
+  return String(str ?? '').replace(/[&<>"']/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
+}
+
+function normalizeSpeechTitle(title) {
+  const value = String(title || '').trim();
+  if (value === 'Преподаватель активно задаёт вопросы студентам') return 'Вопросы преподавателя';
+  if (value === 'Преподаватель реагирует на ответы студентов и развивает обсуждение') return 'Ответы студентов';
+  return value;
 }
 
 function protectMathSegments(text) {
@@ -243,6 +255,774 @@ function normalizeTranscriptLines(transcript) {
   return lines;
 }
 
+function normalizeSearchText(text) {
+  return String(text || '')
+    .toLowerCase()
+    .replace(/[^0-9a-zа-яё]+/gi, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+}
+
+function escapeRegExp(text) {
+  return String(text || '').replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function sampleTranscriptSnippet(lines, index, fallback) {
+  if (!Array.isArray(lines) || !lines.length) return fallback;
+  const item = lines[Math.max(0, index) % lines.length];
+  const text = String(item && item.text ? item.text : '').replace(/\s+/g, ' ').trim();
+  if (!text) return fallback;
+  return text.length > 110 ? text.slice(0, 110).trim() : text;
+}
+
+function normalizeFragmentRange(fragment) {
+  const startMs = Number(fragment && fragment.start_ms !== undefined ? fragment.start_ms : NaN);
+  const endMsRaw = Number(fragment && fragment.end_ms !== undefined ? fragment.end_ms : startMs);
+  const hasStart = Number.isFinite(startMs);
+  const hasEnd = Number.isFinite(endMsRaw);
+  if (!hasStart && !hasEnd) {
+    return { startMs: null, endMs: null };
+  }
+  const start = hasStart ? startMs : endMsRaw;
+  const end = hasEnd ? endMsRaw : start;
+  return start <= end
+    ? { startMs: start, endMs: end }
+    : { startMs: end, endMs: start };
+}
+
+function formatSpeechFragmentType(type) {
+  const value = String(type || '').trim().toLowerCase();
+  const labels = {
+    example: 'пример',
+    analogy: 'аналогия',
+    metaphor: 'метафора',
+    storytelling: 'сторителлинг'
+  };
+  return labels[value] || '';
+}
+
+function formatSpeechFragmentTypeTitle(type) {
+  const value = formatSpeechFragmentType(type);
+  if (!value) return 'Пример';
+  return value.charAt(0).toUpperCase() + value.slice(1);
+}
+
+function getActiveTranscriptHighlight(gen) {
+  if (!gen || activeTranscriptHighlight.generationId !== gen.id) return null;
+  const startMs = Number(activeTranscriptHighlight.startMs);
+  const endMs = Number(activeTranscriptHighlight.endMs);
+  if (!Number.isFinite(startMs)) return null;
+  return {
+    startMs,
+    endMs: Number.isFinite(endMs) ? endMs : startMs
+  };
+}
+
+function setActiveTranscriptHighlight(gen, startMs, endMs = null) {
+  const startValue = Number(startMs);
+  const endValue = Number(endMs);
+  if (!gen || !Number.isFinite(startValue)) {
+    activeTranscriptHighlight = { generationId: '', startMs: null, endMs: null };
+    return;
+  }
+  const normalizedEnd = Number.isFinite(endValue) ? endValue : startValue;
+  activeTranscriptHighlight = {
+    generationId: gen.id,
+    startMs: startValue,
+    endMs: normalizedEnd >= startValue ? normalizedEnd : startValue
+  };
+}
+
+function getSpeechAnalysisAggregate(gen) {
+  const analytics = gen && gen.analytics && typeof gen.analytics === 'object' ? gen.analytics : null;
+  if (!analytics) return null;
+  const speech = analytics.speech_analysis;
+  if (!speech || typeof speech !== 'object') return null;
+  return speech;
+}
+
+function getSpeechAnalysisError(gen) {
+  const analytics = gen && gen.analytics && typeof gen.analytics === 'object' ? gen.analytics : null;
+  if (!analytics) return '';
+  return String(analytics.speech_analysis_error || '').trim();
+}
+
+const ALLOWED_QUESTION_TYPES = new Set([
+  'rhetorical',
+  'checking_understanding',
+  'quiz',
+  'clarifying',
+  'open_ended',
+  'factual',
+  'other'
+]);
+
+function normalizeQuestionType(value) {
+  const normalized = String(value || '').trim().toLowerCase();
+  if (!normalized) return '';
+  const aliases = {
+    rhetorical: 'rhetorical',
+    'риторический': 'rhetorical',
+    checking_understanding: 'checking_understanding',
+    'проверка понимания': 'checking_understanding',
+    quiz: 'quiz',
+    'викторина': 'quiz',
+    clarifying: 'clarifying',
+    'уточняющий': 'clarifying',
+    open_ended: 'open_ended',
+    'open-ended': 'open_ended',
+    'открытый': 'open_ended',
+    factual: 'factual',
+    'фактический': 'factual',
+    other: 'other',
+    'другой': 'other'
+  };
+  return aliases[normalized] || (ALLOWED_QUESTION_TYPES.has(normalized) ? normalized : 'other');
+}
+
+function formatQuestionTypeLabel(value) {
+  const normalized = normalizeQuestionType(value);
+  const labels = {
+    rhetorical: 'риторический',
+    checking_understanding: 'проверка понимания',
+    quiz: 'викторина',
+    clarifying: 'уточняющий',
+    open_ended: 'открытый',
+    factual: 'фактический',
+    other: 'другой'
+  };
+  return labels[normalized] || '';
+}
+
+function normalizeSpeechAnalysisFragment(fragment) {
+  if (!fragment || typeof fragment !== 'object') {
+    const text = String(fragment || '').trim();
+    return { start_ms: 0, end_ms: 0, text };
+  }
+  const startMs = Number(fragment.start_ms);
+  const endMs = Number(fragment.end_ms);
+  const safeStart = Number.isFinite(startMs) ? startMs : 0;
+  const safeEnd = Number.isFinite(endMs) ? Math.max(safeStart, endMs) : safeStart;
+  const normalized = {
+    start_ms: safeStart,
+    end_ms: safeEnd,
+    text: String(fragment.text || '').trim()
+  };
+  const type = String(fragment.type || '').trim();
+  if (type) normalized.type = type;
+  const questionType = normalizeQuestionType(fragment.question_type);
+  if (questionType) normalized.question_type = questionType;
+  return normalized;
+}
+
+function mergeSpeechAnalysisFragments(primary, secondary) {
+  const merged = [];
+  const seen = new Set();
+  [...(Array.isArray(primary) ? primary : []), ...(Array.isArray(secondary) ? secondary : [])].forEach((fragment) => {
+    const normalized = normalizeSpeechAnalysisFragment(fragment);
+    if (!normalized.text) return;
+    const key = `${normalized.start_ms}|${normalized.end_ms}|${normalized.text}|${normalized.type || ''}|${normalized.question_type || ''}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    merged.push(normalized);
+  });
+  return merged;
+}
+
+function chunkAnalysesFromRaw(raw) {
+  if (!raw || typeof raw !== 'object' || !Array.isArray(raw.chunk_analyses)) return [];
+  return raw.chunk_analyses.filter((chunk) => chunk && typeof chunk === 'object');
+}
+
+function flattenChunkField(chunkAnalyses, field) {
+  const fragments = [];
+  chunkAnalyses.forEach((chunk) => {
+    const items = Array.isArray(chunk[field]) ? chunk[field] : [];
+    items.forEach((item) => fragments.push(normalizeSpeechAnalysisFragment(item)));
+  });
+  return fragments;
+}
+
+function buildSpeechAnalysisViewModel(gen) {
+  const raw = getSpeechAnalysisAggregate(gen);
+  if (!raw) return null;
+  const chunkAnalyses = chunkAnalysesFromRaw(raw);
+  const legacyAudience = raw.audience_engagement && typeof raw.audience_engagement === 'object' ? raw.audience_engagement : {};
+  const legacyStructure = raw.lesson_structure && typeof raw.lesson_structure === 'object' ? raw.lesson_structure : {};
+  const legacyExplanation = raw.material_explanation && typeof raw.material_explanation === 'object' ? raw.material_explanation : {};
+  const legacyRecommendation = raw.teacher_recommendation && typeof raw.teacher_recommendation === 'object' ? raw.teacher_recommendation : {};
+  const legacyFlags = raw.flags && typeof raw.flags === 'object' ? raw.flags : {};
+  const legacyQuestions = legacyAudience.questions_to_students && typeof legacyAudience.questions_to_students === 'object' ? legacyAudience.questions_to_students : {};
+  const legacyAnswers = legacyAudience.student_answers && typeof legacyAudience.student_answers === 'object' ? legacyAudience.student_answers : {};
+  const legacyTimeline = legacyStructure.step_by_step_explanation && typeof legacyStructure.step_by_step_explanation === 'object' ? legacyStructure.step_by_step_explanation : {};
+  const legacyGoals = legacyStructure.goals_and_summary && typeof legacyStructure.goals_and_summary === 'object' ? legacyStructure.goals_and_summary : {};
+  const legacyExamples = legacyExplanation.examples_and_analogies && typeof legacyExplanation.examples_and_analogies === 'object' ? legacyExplanation.examples_and_analogies : {};
+  const derivedQuestions = flattenChunkField(chunkAnalyses, 'teacher_questions');
+  const derivedAnswers = flattenChunkField(chunkAnalyses, 'student_answers');
+  const derivedExamples = flattenChunkField(chunkAnalyses, 'examples_and_analogies');
+  const derivedTimeline = [];
+  const derivedIntro = { present: false, start_ms: null, comment: '' };
+  const derivedSummary = { present: false, start_ms: null, comment: '' };
+  const derivedFlags = {
+    profanity: [],
+    familiarity: []
+  };
+  chunkAnalyses.forEach((chunk) => {
+    const events = Array.isArray(chunk.lesson_events) ? chunk.lesson_events : [];
+    events.forEach((event) => {
+      if (!event || typeof event !== 'object') return;
+      const startMs = Number(event.start_ms);
+      const safeStart = Number.isFinite(startMs) ? startMs : 0;
+      derivedTimeline.push({
+        start_ms: safeStart,
+        time: formatTime(safeStart),
+        title: String(event.title || 'Событие урока').trim(),
+        comment: String(event.description || '').trim()
+      });
+    });
+    const goals = chunk.goals_and_summary && typeof chunk.goals_and_summary === 'object' ? chunk.goals_and_summary : {};
+    const intro = goals.intro && typeof goals.intro === 'object' ? goals.intro : {};
+    const summary = goals.summary && typeof goals.summary === 'object' ? goals.summary : {};
+    if (intro.present && !derivedIntro.present) {
+      derivedIntro.present = true;
+      derivedIntro.start_ms = intro.start_ms ?? null;
+      derivedIntro.comment = String(intro.comment || '').trim();
+    }
+    if (summary.present && !derivedSummary.present) {
+      derivedSummary.present = true;
+      derivedSummary.start_ms = summary.start_ms ?? null;
+      derivedSummary.comment = String(summary.comment || '').trim();
+    }
+    const flags = chunk.flags && typeof chunk.flags === 'object' ? chunk.flags : {};
+    if (Array.isArray(flags.profanity)) derivedFlags.profanity.push(...flags.profanity);
+    if (Array.isArray(flags.overly_familiar_tone)) derivedFlags.familiarity.push(...flags.overly_familiar_tone);
+  });
+  derivedTimeline.sort((a, b) => Number(a.start_ms || 0) - Number(b.start_ms || 0));
+  return {
+    format: {
+      label: String(raw.lesson_format && raw.lesson_format.format ? raw.lesson_format.format : (chunkAnalyses.length ? 'Агрегированный анализ речи преподавателя' : 'Формат занятия не определен')),
+      comment: String(raw.lesson_format && raw.lesson_format.comment ? raw.lesson_format.comment : (chunkAnalyses.length ? `Проанализировано чанков: ${chunkAnalyses.length}` : 'Агрегированный анализ речи преподавателя готов.')),
+    },
+    engagement: {
+      questions: {
+        title: normalizeSpeechTitle(legacyQuestions.title || 'Вопросы преподавателя'),
+        comment: String(legacyQuestions.comment || ''),
+        fragments: mergeSpeechAnalysisFragments(legacyQuestions.fragments, derivedQuestions)
+      },
+      answers: {
+        title: normalizeSpeechTitle(legacyAnswers.title || 'Ответы студентов'),
+        comment: String(legacyAnswers.comment || ''),
+        fragments: mergeSpeechAnalysisFragments(legacyAnswers.fragments, derivedAnswers)
+      }
+    },
+    structure: {
+      timeline: {
+        title: String(legacyTimeline.title || 'Таймлайн урока'),
+        items: Array.isArray(legacyTimeline.timeline) && legacyTimeline.timeline.length
+          ? legacyTimeline.timeline.map((item) => ({
+              time: String(item && item.time ? item.time : formatTime(Number(item && item.start_ms ? item.start_ms : 0))),
+              title: String(item && item.title ? item.title : 'Событие урока'),
+              comment: String(item && (item.description || item.comment) ? (item.description || item.comment) : '')
+            }))
+          : derivedTimeline
+      },
+      goals: {
+        title: String(legacyGoals.title || 'Цели и итоги урока'),
+        introduction: {
+          passed: Boolean(legacyGoals.intro && legacyGoals.intro.present) || derivedIntro.present,
+          comment: String(legacyGoals.intro && legacyGoals.intro.comment ? legacyGoals.intro.comment : derivedIntro.comment || '')
+        },
+        ending: {
+          passed: Boolean(legacyGoals.summary && legacyGoals.summary.present) || derivedSummary.present,
+          comment: String(legacyGoals.summary && legacyGoals.summary.comment ? legacyGoals.summary.comment : derivedSummary.comment || '')
+        }
+      }
+    },
+    explanation: {
+      title: String(legacyExamples.title || 'Примеры, аналогии и сторителлинг'),
+      fragments: mergeSpeechAnalysisFragments(legacyExamples.fragments, derivedExamples)
+    },
+    recommendation: {
+      title: String(legacyRecommendation.title || 'Рекомендация преподавателю'),
+      comment: String(legacyRecommendation.comment || '')
+    },
+    flags: {
+      profanity: {
+        title: String(legacyFlags.profanity && legacyFlags.profanity.title ? legacyFlags.profanity.title : 'Ненормативная лексика'),
+        passed: Boolean(legacyFlags.profanity && legacyFlags.profanity.present) || derivedFlags.profanity.length > 0,
+        fragments: mergeSpeechAnalysisFragments(legacyFlags.profanity && legacyFlags.profanity.fragments, derivedFlags.profanity)
+      },
+      familiarity: {
+        title: String(legacyFlags.overly_familiar_tone && legacyFlags.overly_familiar_tone.title ? legacyFlags.overly_familiar_tone.title : 'Панибратство'),
+        passed: Boolean(legacyFlags.overly_familiar_tone && legacyFlags.overly_familiar_tone.present) || derivedFlags.familiarity.length > 0,
+        fragments: mergeSpeechAnalysisFragments(legacyFlags.overly_familiar_tone && legacyFlags.overly_familiar_tone.fragments, derivedFlags.familiarity)
+      }
+    }
+  };
+}
+
+function getGenerationAgeMs(gen) {
+  if (!gen || !gen.created_at) return 0;
+  const createdAt = new Date(gen.created_at);
+  if (Number.isNaN(createdAt.getTime())) return 0;
+  return Math.max(0, Date.now() - createdAt.getTime());
+}
+
+function getSpeechAnalysisState(gen) {
+  if (!gen) return null;
+  if (!gen.ui) gen.ui = {};
+  if (!gen.ui.speechAnalysisExpanded || typeof gen.ui.speechAnalysisExpanded !== 'object') {
+    gen.ui.speechAnalysisExpanded = {};
+  }
+  return gen.ui.speechAnalysisExpanded;
+}
+
+function buildSpeechAnalysisPrototype(gen) {
+  const transcriptLines = normalizeTranscriptLines(gen && gen.transcript ? gen.transcript : []);
+  const questionSnippets = [
+    sampleTranscriptSnippet(transcriptLines, 0, 'Как вы думаете, почему это важно?'),
+    sampleTranscriptSnippet(transcriptLines, 3, 'Можно привести другой пример из практики?'),
+    sampleTranscriptSnippet(transcriptLines, 6, 'Почему здесь возникает именно такой вывод?'),
+    'Как вы думаете, почему это важно?',
+    'Можно привести другой пример из практики?',
+    'Почему здесь возникает именно такой вывод?'
+  ];
+  const answerSnippets = [
+    sampleTranscriptSnippet(transcriptLines, 1, 'Студент отвечает коротко и по существу.'),
+    sampleTranscriptSnippet(transcriptLines, 4, 'Ответ студентов становится более уверенным после уточнения вопроса.'),
+    sampleTranscriptSnippet(transcriptLines, 7, 'Есть аккуратная попытка сформулировать мысль своими словами.'),
+    'Студент отвечает коротко и по существу.',
+    'Ответ студентов становится более уверенным после уточнения вопроса.',
+    'Есть аккуратная попытка сформулировать мысль своими словами.'
+  ];
+  const explanationSnippets = [
+    sampleTranscriptSnippet(transcriptLines, 2, 'Преподаватель объясняет через пример и короткую аналогию.'),
+    sampleTranscriptSnippet(transcriptLines, 5, 'Сначала идет правило, затем мягкое уточнение и иллюстрация.'),
+    sampleTranscriptSnippet(transcriptLines, 8, 'Объяснение строится последовательно и без лишнего усложнения.'),
+    'Преподаватель объясняет через пример и короткую аналогию.',
+    'Сначала идет правило, затем мягкое уточнение и иллюстрация.',
+    'Объяснение строится последовательно и без лишнего усложнения.'
+  ];
+  const profanitySnippets = [
+    sampleTranscriptSnippet(transcriptLines, 10, 'Здесь встречается резкая формулировка, которую стоит смягчить.'),
+    sampleTranscriptSnippet(transcriptLines, 12, 'Наблюдается слишком разговорный тон в адрес аудитории.'),
+    'Здесь встречается резкая формулировка, которую стоит смягчить.',
+    'Наблюдается слишком разговорный тон в адрес аудитории.'
+  ];
+  const familiaritySnippets = [
+    sampleTranscriptSnippet(transcriptLines, 11, 'Используется дружеское обращение, которое может звучать панибратски.'),
+    sampleTranscriptSnippet(transcriptLines, 13, 'Обращение к студентам слишком фамильярное для академического контекста.'),
+    'Используется дружеское обращение, которое может звучать панибратски.',
+    'Обращение к студентам слишком фамильярное для академического контекста.'
+  ];
+
+  return {
+    format: {
+      label: 'Смешанный формат с диалогом и короткими уточнениями',
+      comment: 'Преподаватель не только объясняет материал, но и периодически втягивает аудиторию в мини-диалог, чтобы удерживать внимание и быстро проверять понимание.'
+    },
+    engagement: {
+      questions: {
+        title: 'Вопросы преподавателя',
+        fragments: questionSnippets.map((text) => ({ text }))
+      },
+      answers: {
+        title: 'Ответы студентов',
+        fragments: answerSnippets.map((text) => ({ text }))
+      }
+    },
+    structure: {
+      timeline: {
+        title: 'Таймлайн урока',
+        items: [
+          { time: '00:00–01:10', title: 'Вход в тему', comment: 'Преподаватель обозначает рамку и быстро возвращает группу к базовому контексту.' },
+          { time: '01:10–03:00', title: 'Ключевое объяснение', comment: 'Материал раскрывается последовательно, с опорой на одно центральное правило.' },
+          { time: '03:00–04:30', title: 'Проверка понимания', comment: 'После объяснения следуют уточняющие вопросы и короткая сверка реакции аудитории.' },
+          { time: '04:30–06:00', title: 'Закрепление примером', comment: 'Преподаватель переводит теорию в практический пример и упрощает формулировки.' }
+        ]
+      },
+      goals: {
+        title: 'Цели и итоги урока',
+        introduction: {
+          passed: true,
+          comment: 'В начале занятия преподаватель быстро обозначает, чему именно будет посвящен фокус урока.'
+        },
+        ending: {
+          passed: false,
+          comment: ''
+        }
+      }
+    },
+    explanation: {
+      title: 'Примеры, аналогии и сторителлинг',
+      fragments: explanationSnippets.map((text) => ({ text }))
+    },
+    flags: {
+      profanity: {
+        title: 'Ненормативная лексика',
+        passed: false,
+        fragments: profanitySnippets.map((text) => ({ text }))
+      },
+      familiarity: {
+        title: 'Панибратство',
+        passed: true,
+        fragments: familiaritySnippets.map((text) => ({ text }))
+      }
+    }
+  };
+}
+
+function renderSpeechFragment(fragment, gen, sectionKey, index, transcriptLines = []) {
+  const text = String(fragment && fragment.text ? fragment.text : fragment || '').trim();
+  if (!text) return '';
+  const range = normalizeFragmentRange(fragment);
+  const startMs = range.startMs;
+  const endMs = range.endMs;
+  const lineExists = Number.isFinite(startMs)
+    && transcriptLines.some((line) => {
+      const lineStart = Number(line.start_ms || 0);
+      return Number.isFinite(lineStart) && lineStart >= startMs && lineStart <= (Number.isFinite(endMs) ? endMs : startMs);
+    });
+  const typeLabel = formatSpeechFragmentType(fragment && fragment.type);
+  const questionTypeLabel = sectionKey === 'engagement_questions'
+    ? formatQuestionTypeLabel(fragment && fragment.question_type)
+    : '';
+  const labelHtml = [
+    typeLabel ? ` <span class="speech-fragment-type">(${escapeHtml(typeLabel)})</span>` : '',
+    questionTypeLabel ? ` <span class="speech-fragment-type speech-question-type">[${escapeHtml(questionTypeLabel)}]</span>` : ''
+  ].join('');
+  if (!lineExists) {
+    return `<span class="speech-fragment-text">${escapeHtml(text)}${labelHtml}</span>`;
+  }
+  return `
+    <button
+      type="button"
+      class="speech-fragment-link"
+      data-speech-fragment="true"
+      data-speech-start-ms="${escapeHtml(startMs)}"
+      data-speech-end-ms="${escapeHtml(Number.isFinite(endMs) ? endMs : startMs)}"
+      data-speech-section="${escapeHtml(sectionKey)}"
+      data-speech-index="${index}"
+      aria-label="Перейти к фрагменту в транскрипте"
+      title="Перейти к фрагменту в транскрипте"
+    >${escapeHtml(text)}${labelHtml}</button>
+  `;
+}
+
+function renderSpeechFragmentList(fragments, gen, sectionKey, expanded = false, transcriptLines = []) {
+  const items = Array.isArray(fragments) ? fragments : [];
+  const listHtml = items
+    .map((fragment, index) => renderSpeechFragment(fragment, gen, sectionKey, index, transcriptLines))
+    .filter(Boolean)
+    .map((fragmentHtml) => `<div class="speech-fragment-line">${fragmentHtml}</div>`)
+    .join('');
+  return `
+    <div class="speech-fragment-list-wrap">
+      <div class="speech-fragment-list">${listHtml}</div>
+    </div>
+  `;
+}
+
+function renderSpeechCheck(title, value) {
+  const passed = Boolean(value && value.passed);
+  const label = passed ? '✓' : '✕';
+  const cls = passed ? 'speech-check yes' : 'speech-check no';
+  const comment = passed && value.comment
+    ? `<span class="speech-check-comment-inline">${escapeHtml(value.comment)}</span>`
+    : '';
+  return `
+    <div class="speech-check-row">
+      <span class="speech-check-label">${escapeHtml(title || '')}</span>
+      <span class="${cls}">${label}</span>
+    </div>
+    ${comment ? `<div class="speech-check-comment-inline">${escapeHtml(value.comment)}</div>` : ''}
+  `;
+}
+
+function renderSpeechGoal(label, goal) {
+  const passed = Boolean(goal && goal.passed);
+  return `
+    <div class="speech-goal-row">
+      <div class="speech-goal-head">
+        <div class="speech-goal-label">${escapeHtml(label)}</div>
+        <div class="speech-goal-badge ${passed ? 'yes' : 'no'}">${passed ? '✓' : '✕'}</div>
+      </div>
+      ${passed && goal.comment ? `<div class="speech-goal-comment">${escapeHtml(goal.comment)}</div>` : ''}
+    </div>
+  `;
+}
+
+function renderSpeechTimeline(items) {
+  return (Array.isArray(items) ? items : [])
+    .map((item) => `
+      <div class="speech-timeline-item">
+        <div class="speech-timeline-time">${escapeHtml(item.time || '')}</div>
+        <div class="speech-timeline-body">
+          <div class="speech-timeline-title">${escapeHtml(item.title || '')}</div>
+          <div class="speech-timeline-comment">${escapeHtml(item.comment || '')}</div>
+        </div>
+      </div>
+    `)
+    .join('');
+}
+
+function escapeXml(value) {
+  return String(value || '')
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&apos;');
+}
+
+function sanitizeWorksheetName(name, fallback = 'Лист') {
+  const cleaned = String(name || fallback)
+    .replace(/[\[\]\*\/\\\?:]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return cleaned.slice(0, 31) || fallback;
+}
+
+function transcriptFragmentExportData(fragment, transcriptLines) {
+  const text = String(fragment && fragment.text ? fragment.text : fragment || '').trim();
+  if (!text) {
+    return {
+      fragment: '',
+      found: 'Нет',
+      transcriptText: '',
+      timestamp: ''
+    };
+  }
+  const range = normalizeFragmentRange(fragment);
+  const startMs = range.startMs;
+  const endMs = range.endMs;
+  const match = Number.isFinite(startMs)
+    ? transcriptLines.find((line) => {
+        const lineStart = Number(line.start_ms || 0);
+        return Number.isFinite(lineStart) && lineStart >= startMs && lineStart <= (Number.isFinite(endMs) ? endMs : startMs);
+      })
+    : null;
+  const typeLabel = formatSpeechFragmentType(fragment && fragment.type);
+  const fragmentText = typeLabel ? `${text} (${typeLabel})` : text;
+  const timestamp = Number.isFinite(startMs)
+    ? (Number.isFinite(endMs) && endMs > startMs ? `${formatTime(startMs)}–${formatTime(endMs)}` : formatTime(startMs))
+    : '';
+  return {
+    fragment: fragmentText,
+    found: match ? 'Да' : 'Нет',
+    transcriptText: match ? String(match.text || '') : '',
+    timestamp: match ? timestamp : (Number.isFinite(startMs) ? timestamp : '')
+  };
+}
+
+function buildSpeechAnalysisExportSheets(gen) {
+  const transcriptLines = normalizeTranscriptLines(gen && gen.transcript ? gen.transcript : []);
+  const speech = buildSpeechAnalysisViewModel(gen);
+  if (!speech) return [];
+
+  const overviewRows = [
+    ['Параметр', 'Значение'],
+    ['Формат занятия', speech.format.label],
+    ['Комментарий', speech.format.comment],
+  ];
+
+  const engagementRows = [
+    ['Подблок', 'Тип вопроса', 'Фрагмент', 'Найден в транскрипте', 'Время', 'Текст совпадения']
+  ];
+  [
+    ['Вопросы преподавателя', speech.engagement.questions.fragments],
+    ['Ответы студентов', speech.engagement.answers.fragments]
+  ].forEach(([sectionTitle, fragments]) => {
+    fragments.forEach((fragment) => {
+      const data = transcriptFragmentExportData(fragment, transcriptLines);
+      engagementRows.push([
+        sectionTitle,
+        sectionTitle === 'Вопросы преподавателя' ? formatQuestionTypeLabel(fragment.question_type) : '',
+        data.fragment,
+        data.found,
+        data.timestamp,
+        data.transcriptText
+      ]);
+    });
+  });
+
+  const recommendationRows = [
+    ['Подблок', 'Параметр', 'Значение', 'Найден в транскрипте', 'Время', 'Текст совпадения']
+  ];
+  recommendationRows.push(['Рекомендация преподавателю', 'Заголовок', speech.recommendation.title, '', '', '']);
+  recommendationRows.push(['Рекомендация преподавателю', 'Комментарий', speech.recommendation.comment, '', '', '']);
+  recommendationRows.push(['Вопросы преподавателя', 'Заголовок', speech.engagement.questions.title, '', '', '']);
+  recommendationRows.push(['Вопросы преподавателя', 'Комментарий', speech.engagement.questions.comment || '', '', '', '']);
+  speech.engagement.questions.fragments.forEach((fragment) => {
+    const data = transcriptFragmentExportData(fragment, transcriptLines);
+    recommendationRows.push(['Вопросы преподавателя', `Фрагмент${fragment.question_type ? ` (${formatQuestionTypeLabel(fragment.question_type)})` : ''}`, data.fragment, data.found, data.timestamp, data.transcriptText]);
+  });
+  recommendationRows.push(['Ответы студентов', 'Заголовок', speech.engagement.answers.title, '', '', '']);
+  recommendationRows.push(['Ответы студентов', 'Комментарий', speech.engagement.answers.comment || '', '', '', '']);
+  speech.engagement.answers.fragments.forEach((fragment) => {
+    const data = transcriptFragmentExportData(fragment, transcriptLines);
+    recommendationRows.push(['Ответы студентов', 'Фрагмент', data.fragment, data.found, data.timestamp, data.transcriptText]);
+  });
+
+  const structureRows = [
+    ['Подблок', 'Параметр', 'Значение']
+  ];
+  speech.structure.timeline.items.forEach((item) => {
+    structureRows.push(['Таймлайн урока', item.time || '', `${item.title || ''}${item.comment ? ` — ${item.comment}` : ''}`]);
+  });
+  structureRows.push(['Цели и итоги урока', 'Введение', speech.structure.goals.introduction.passed ? `✓ ${speech.structure.goals.introduction.comment || ''}` : '✕']);
+  structureRows.push(['Цели и итоги урока', 'Завершение', speech.structure.goals.ending.passed ? `✓ ${speech.structure.goals.ending.comment || ''}` : '✕']);
+
+  const explanationRows = [
+    ['Подблок', 'Фрагмент', 'Найден в транскрипте', 'Время', 'Текст совпадения']
+  ];
+  speech.explanation.fragments.forEach((fragment) => {
+    const data = transcriptFragmentExportData(fragment, transcriptLines);
+    explanationRows.push([formatSpeechFragmentTypeTitle(fragment && fragment.type), data.fragment, data.found, data.timestamp, data.transcriptText]);
+  });
+
+  const flagsRows = [
+    ['Подблок', 'Фрагмент', 'Найден в транскрипте', 'Время', 'Текст совпадения']
+  ];
+  [
+    [speech.flags.profanity.title, speech.flags.profanity],
+    [speech.flags.familiarity.title, speech.flags.familiarity]
+  ].forEach(([title, flag]) => {
+    if (!flag.passed) {
+      flagsRows.push([title, 'Фрагменты не показываются, так как флаг не подтвержден', 'Нет', '', '']);
+      return;
+    }
+    flag.fragments.forEach((fragment) => {
+      const data = transcriptFragmentExportData(fragment, transcriptLines);
+      flagsRows.push([title, data.fragment, data.found, data.timestamp, data.transcriptText]);
+    });
+  });
+
+  return [
+    { name: 'Обзор', rows: overviewRows },
+    { name: 'Рекомендации', rows: recommendationRows },
+    { name: 'Вовлечение', rows: engagementRows },
+    { name: 'Структура', rows: structureRows },
+    { name: 'Объяснение', rows: explanationRows },
+    { name: 'Флаги', rows: flagsRows }
+  ];
+}
+
+function buildSpreadsheetXml(worksheets) {
+  const sheetXml = (rows) => {
+    const body = rows.map((row) => `
+      <Row>
+        ${row.map((cell) => `<Cell><Data ss:Type="String">${escapeXml(cell)}</Data></Cell>`).join('')}
+      </Row>
+    `).join('');
+    return `<Table>${body}</Table>`;
+  };
+
+  const wsXml = (sheet) => `
+    <Worksheet ss:Name="${escapeXml(sanitizeWorksheetName(sheet.name))}">
+      ${sheetXml(sheet.rows || [])}
+    </Worksheet>
+  `;
+
+  return `<?xml version="1.0"?>
+  <?mso-application progid="Excel.Sheet"?>
+  <Workbook xmlns="urn:schemas-microsoft-com:office:spreadsheet"
+            xmlns:o="urn:schemas-microsoft-com:office:office"
+            xmlns:x="urn:schemas-microsoft-com:office:excel"
+            xmlns:ss="urn:schemas-microsoft-com:office:spreadsheet"
+            xmlns:html="http://www.w3.org/TR/REC-html40">
+    <Styles>
+      <Style ss:ID="Default" ss:Name="Normal">
+        <Alignment ss:Vertical="Top"/>
+        <Font ss:FontName="Arial" ss:Size="10"/>
+      </Style>
+    </Styles>
+    ${worksheets.map(wsXml).join('\n')}
+  </Workbook>`;
+}
+
+function downloadTextFile(filename, content, mimeType) {
+  const blob = new Blob([content], { type: mimeType });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+
+async function exportSpeechAnalysisToExcel(gen) {
+  if (!gen) return;
+  const exportId = String(gen.id || 'export').slice(0, 16);
+  const baseName = `speech_analysis_${exportId}.xlsx`;
+  const speechAnalysis = getSpeechAnalysisAggregate(gen);
+  const transcript = Array.isArray(gen.transcript) ? gen.transcript : [];
+  const downloadResponse = async (response) => {
+    const blob = await response.blob();
+    const url = URL.createObjectURL(blob);
+    const link = document.createElement('a');
+    link.href = url;
+    link.download = baseName;
+    document.body.appendChild(link);
+    link.click();
+    link.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 1000);
+  };
+  try {
+    const response = await fetch(`/api/generations/${encodeURIComponent(gen.id)}/speech-analysis.xlsx`, {
+      method: 'GET',
+      credentials: 'same-origin'
+    });
+    if (!response.ok) {
+      if (speechAnalysis) {
+        const payloadResponse = await fetch(`/api/generations/${encodeURIComponent(gen.id)}/speech-analysis.xlsx`, {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            transcript,
+            speech_analysis: speechAnalysis
+          })
+        });
+        if (payloadResponse.ok) {
+          await downloadResponse(payloadResponse);
+          return;
+        }
+      }
+      showPopover('Экспорт пока недоступен: анализ речи преподавателя ещё не готов.');
+      return;
+    }
+    await downloadResponse(response);
+  } catch (_error) {
+    try {
+      if (speechAnalysis) {
+        const payloadResponse = await fetch(`/api/generations/${encodeURIComponent(gen.id)}/speech-analysis.xlsx`, {
+          method: 'POST',
+          credentials: 'same-origin',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            transcript,
+            speech_analysis: speechAnalysis
+          })
+        });
+        if (payloadResponse.ok) {
+          await downloadResponse(payloadResponse);
+          return;
+        }
+      }
+    } catch (_payloadError) {
+      // ignore and fall through to the user-facing message
+    }
+    showPopover('Не удалось скачать Excel-файл.');
+  }
+}
+
 function markdownInlineToHtml(text) {
   let html = escapeHtml(normalizeTextBreaks(text));
   const protectedMath = protectMathSegments(html);
@@ -264,7 +1044,7 @@ function markdownInlineToHtmlQuiz(text) {
 }
 
 function formatMarkdownToHtml(text) {
-  const source = escapeHtml(normalizeTextBreaks(removePunctuationAfterBlockMath(text)));
+  const source = escapeHtml(normalizeTextBreaks(removePunctuationAfterBlockMath(text))).replace(/#/g, '');
   const protectedMath = protectMathSegments(source);
   let html = protectedMath.text;
 
@@ -275,6 +1055,22 @@ function formatMarkdownToHtml(text) {
     codeParts.push({ lang: lang || 'plaintext', code });
     return token;
   });
+
+  const renderInline = (value) => {
+    let inline = String(value || '');
+    const inlineCodeParts = [];
+    inline = inline.replace(/`([^`\n]+)`/g, (_match, code) => {
+      const token = `@@INLINE_CODE_${inlineCodeParts.length}@@`;
+      inlineCodeParts.push(code);
+      return token;
+    });
+    inline = inline
+      .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+      .replace(/\*(.*?)\*/g, '<em>$1</em>')
+      .replace(/\n/g, '<br>')
+      .replace(/@@INLINE_CODE_(\d+)@@/g, (_m, idx) => `<span class="inline-code">${inlineCodeParts[Number(idx)] || ''}</span>`);
+    return inline;
+  };
 
   const blocks = html.split(/\n{2,}/).map((block) => block.trim()).filter(Boolean);
 
@@ -289,26 +1085,155 @@ function formatMarkdownToHtml(text) {
       });
     }
 
-    const listMatch = block.match(/^(?:\* .+(?:\n|$))+$/);
-    if (listMatch) {
-      const items = block
-        .split('\n')
-        .map((line) => line.trim())
-        .filter((line) => line.startsWith('* '))
-        .map((line) => `<li>${line.slice(2).trim()}</li>`)
-        .join('');
-      return `<ul>${items}</ul>`;
+    const lines = block.split('\n').map((line) => line.trimEnd()).filter(Boolean);
+    const isTableDivider = (line) => {
+      const cells = line.split('|').map((cell) => cell.trim()).filter(Boolean);
+      return cells.length >= 2 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+    };
+    const isListLine = (line) => /^[\*\-\u2013\u2014] /.test(line.trim());
+    const splitRow = (line) => {
+      const rawCells = line.split('|').map((cell) => cell.trim());
+      const cells = rawCells.filter((cell, idx, arr) => !(idx === 0 && !line.startsWith('|') && cell === '') && !(idx === arr.length - 1 && !line.endsWith('|') && cell === ''));
+      while (cells.length && !cells[0]) cells.shift();
+      while (cells.length && !cells[cells.length - 1]) cells.pop();
+      return cells;
+    };
+
+    const parts = [];
+    let i = 0;
+    while (i < lines.length) {
+      const current = lines[i];
+      const next = lines[i + 1] || '';
+
+      if (current && current.includes('|') && isTableDivider(next)) {
+        const tableLines = [current, next];
+        i += 2;
+        while (i < lines.length && lines[i].includes('|')) {
+          tableLines.push(lines[i]);
+          i += 1;
+        }
+        const rows = tableLines.map((line) => splitRow(line));
+        const header = rows[0] || [];
+        const bodyRows = rows.slice(2);
+        const columnCount = Math.max(1, ...rows.map((row) => row.length));
+        const colgroup = Array.from({ length: columnCount }, () => '<col style="width:clamp(100px, 18vw, 240px);">').join('');
+        const headerHtml = header.map((cell) => `<th>${renderInline(cell)}</th>`).join('');
+        const bodyHtml = bodyRows
+          .map((row) => `<tr>${row.map((cell) => `<td>${renderInline(cell)}</td>`).join('')}${Array.from({ length: Math.max(0, columnCount - row.length) }, () => '<td></td>').join('')}</tr>`)
+          .join('');
+        parts.push(`<div class="table-wrap"><table class="markdown-table"><colgroup>${colgroup}</colgroup><thead><tr>${headerHtml}${Array.from({ length: Math.max(0, columnCount - header.length) }, () => '<th></th>').join('')}</tr></thead><tbody>${bodyHtml}</tbody></table></div>`);
+        continue;
+      }
+
+      if (isListLine(current)) {
+        const listItems = [];
+        while (i < lines.length && isListLine(lines[i])) {
+          listItems.push(`<li>${renderInline(lines[i].replace(/^[\*\-\u2013\u2014]\s+/, '').trim())}</li>`);
+          i += 1;
+        }
+        parts.push(`<ul>${listItems.join('')}</ul>`);
+        continue;
+      }
+
+      const paragraphLines = [current];
+      i += 1;
+      while (
+        i < lines.length
+        && !isListLine(lines[i])
+        && !(lines[i].includes('|') && isTableDivider(lines[i + 1] || ''))
+      ) {
+        paragraphLines.push(lines[i]);
+        i += 1;
+      }
+      parts.push(`<p>${renderInline(paragraphLines.join('<br>'))}</p>`);
     }
 
-    let content = block
-      .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-      .replace(/\*(.*?)\*/g, '<em>$1</em>')
-      .replace(/\n/g, '<br>');
-    return `<p>${content}</p>`;
+    return parts.join('');
   });
 
   html = formattedBlocks.join('');
   return restoreMathSegments(html, protectedMath.mathParts);
+}
+
+function formatMarkdownToHtmlEditor(text) {
+  const source = escapeHtml(normalizeTextBreaks(removePunctuationAfterBlockMath(text))).replace(/#/g, '');
+  const protectedMath = protectMathSegments(source);
+  let html = protectedMath.text;
+
+  const blocks = html.split(/\n{2,}/).map((block) => block.trim()).filter(Boolean);
+
+  const formattedBlocks = blocks.map((block) => {
+    const lines = block.split('\n').map((line) => line.trimEnd()).filter(Boolean);
+    const renderInline = (value) => String(value || '')
+      .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+      .replace(/\*(.*?)\*/g, '<em>$1</em>')
+      .replace(/\n/g, '<br>');
+    const isTableDivider = (line) => {
+      const cells = line.split('|').map((cell) => cell.trim()).filter(Boolean);
+      return cells.length >= 2 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
+    };
+    const isListLine = (line) => /^[\*\-\u2013\u2014] /.test(line.trim());
+    const splitRow = (line) => {
+      const rawCells = line.split('|').map((cell) => cell.trim());
+      const cells = rawCells.filter((cell, idx, arr) => !(idx === 0 && !line.startsWith('|') && cell === '') && !(idx === arr.length - 1 && !line.endsWith('|') && cell === ''));
+      while (cells.length && !cells[0]) cells.shift();
+      while (cells.length && !cells[cells.length - 1]) cells.pop();
+      return cells;
+    };
+
+    const parts = [];
+    let i = 0;
+    while (i < lines.length) {
+      const current = lines[i];
+      const next = lines[i + 1] || '';
+
+      if (current && current.includes('|') && isTableDivider(next)) {
+        const tableLines = [current, next];
+        i += 2;
+        while (i < lines.length && lines[i].includes('|')) {
+          tableLines.push(lines[i]);
+          i += 1;
+        }
+        const rows = tableLines.map((line) => splitRow(line));
+        const header = rows[0] || [];
+        const bodyRows = rows.slice(2);
+        const columnCount = Math.max(1, ...rows.map((row) => row.length));
+        const colgroup = Array.from({ length: columnCount }, () => '<col style="width:clamp(100px, 18vw, 240px);">').join('');
+        const headerHtml = header.map((cell) => `<th>${renderInline(cell)}</th>`).join('');
+        const bodyHtml = bodyRows
+          .map((row) => `<tr>${row.map((cell) => `<td>${renderInline(cell)}</td>`).join('')}${Array.from({ length: Math.max(0, columnCount - row.length) }, () => '<td></td>').join('')}</tr>`)
+          .join('');
+        parts.push(`<div class="table-wrap"><table class="markdown-table"><colgroup>${colgroup}</colgroup><thead><tr>${headerHtml}${Array.from({ length: Math.max(0, columnCount - header.length) }, () => '<th></th>').join('')}</tr></thead><tbody>${bodyHtml}</tbody></table></div>`);
+        continue;
+      }
+
+      if (isListLine(current)) {
+        const listItems = [];
+        while (i < lines.length && isListLine(lines[i])) {
+          listItems.push(`<li>${renderInline(lines[i].replace(/^[\*\-\u2013\u2014]\s+/, '').trim())}</li>`);
+          i += 1;
+        }
+        parts.push(`<ul>${listItems.join('')}</ul>`);
+        continue;
+      }
+
+      const paragraphLines = [current];
+      i += 1;
+      while (
+        i < lines.length
+        && !isListLine(lines[i])
+        && !(lines[i].includes('|') && isTableDivider(lines[i + 1] || ''))
+      ) {
+        paragraphLines.push(lines[i]);
+        i += 1;
+      }
+      parts.push(`<p>${renderInline(paragraphLines.join('<br>'))}</p>`);
+    }
+
+    return parts.join('');
+  });
+
+  return restoreMathSegments(formattedBlocks.join(''), protectedMath.mathParts);
 }
 
 function statusLabel(status) {
@@ -441,7 +1366,9 @@ function enrichGeneration(gen) {
     practiceRoundSubmitting: false,
     practiceQuizIndex: 0,
     practiceQuizAnswers: [],
-    practiceQuizFinished: false
+    practiceQuizFinished: false,
+    speechAnalysisRetryPending: false,
+    speechAnalysisExpanded: {}
   };
   if (!nextUi.quizCheckStatus) nextUi.quizCheckStatus = 'idle';
   if (!('quizCheckResult' in nextUi)) nextUi.quizCheckResult = null;
@@ -451,6 +1378,8 @@ function enrichGeneration(gen) {
   if (typeof nextUi.practiceQuizIndex !== 'number') nextUi.practiceQuizIndex = 0;
   if (!Array.isArray(nextUi.practiceQuizAnswers)) nextUi.practiceQuizAnswers = [];
   if (typeof nextUi.practiceQuizFinished !== 'boolean') nextUi.practiceQuizFinished = false;
+  if (typeof nextUi.speechAnalysisRetryPending !== 'boolean') nextUi.speechAnalysisRetryPending = false;
+  if (!nextUi.speechAnalysisExpanded || typeof nextUi.speechAnalysisExpanded !== 'object') nextUi.speechAnalysisExpanded = {};
   generationUiState[gen.id] = nextUi;
   return {
     ...gen,
@@ -585,9 +1514,22 @@ function renderTranscript(gen) {
     return;
   }
   const transcriptLines = normalizeTranscriptLines(gen.transcript);
+  const activeHighlight = getActiveTranscriptHighlight(gen);
   const transcriptHtml = transcriptLines.length
     ? transcriptLines
-      .map((line) => `<div class="transcript-line"><div class="timestamp">${formatTime(line.start_ms)}</div><div class="line-text">${escapeHtml(line.text || '')}</div></div>`)
+      .map((line, idx) => {
+        const lineStartMs = Number(line.start_ms || 0);
+        const shouldHighlight = activeHighlight
+          && Number.isFinite(lineStartMs)
+          && lineStartMs >= Number(activeHighlight.startMs)
+          && lineStartMs <= Number(activeHighlight.endMs);
+        return `
+          <div class="transcript-line ${shouldHighlight ? 'is-highlighted' : ''}" data-line-index="${idx}" data-start-ms="${escapeHtml(line.start_ms || 0)}">
+            <div class="timestamp">${formatTime(line.start_ms)}</div>
+            <div class="line-text">${escapeHtml(line.text || '')}</div>
+          </div>
+        `;
+      })
       .join('')
     : '';
   const progress = Math.max(0, Math.min(100, Math.round(Number(gen.progress_percent || 0))));
@@ -602,6 +1544,12 @@ function renderTranscript(gen) {
       ${isProcessing ? `<div class="status-message" style="margin-top: 16px;"><span class="spinner-small"></span> ${escapeHtml(loaderText)}${progress < 100 ? ` <span class="progress-fixed">${progress}%</span>` : ''}</div>` : ''}
     `;
     requestAnimationFrame(updateTranscriptJumpButton);
+    if (activeHighlight) {
+      requestAnimationFrame(() => {
+        const targetLine = transcriptContainer.querySelector('.transcript-line.is-highlighted');
+        if (targetLine) targetLine.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      });
+    }
     return;
   }
   if (isProcessing) {
@@ -621,6 +1569,14 @@ function renderTranscript(gen) {
   }
   transcriptContainer.innerHTML = '<div class="status-message">Транскрипт отсутствует</div>';
   updateTranscriptJumpButton();
+}
+
+function scrollToActiveTranscriptHighlight() {
+  if (!transcriptContainer) return;
+  const targetLine = transcriptContainer.querySelector('.transcript-line.is-highlighted');
+  if (targetLine) {
+    targetLine.scrollIntoView({ behavior: 'smooth', block: 'center' });
+  }
 }
 
 function updateTranscriptJumpButton() {
@@ -646,12 +1602,30 @@ function nodesToMarkdown(nodes) {
     if (node.nodeType !== Node.ELEMENT_NODE) continue;
     const tag = node.tagName.toLowerCase();
     const children = Array.from(node.childNodes);
+    const renderCellMarkdown = (cellNode) => nodesToMarkdown(Array.from(cellNode.childNodes)).trim().replace(/\n+/g, ' ').replace(/\|/g, '\\|');
 
     if (tag === 'br') result += '\n';
     else if (tag === 'strong' || tag === 'b') result += `**${nodesToMarkdown(children).trim()}**`;
     else if (tag === 'em' || tag === 'i') result += `*${nodesToMarkdown(children).trim()}*`;
     else if (tag === 'li') result += `* ${nodesToMarkdown(children).trim()}\n`;
     else if (tag === 'ul' || tag === 'ol') result += `${nodesToMarkdown(children)}\n`;
+    else if (tag === 'table') {
+      const rows = Array.from(node.querySelectorAll('tr')).map((row) => Array.from(row.children).filter((cell) => ['TH', 'TD'].includes(cell.tagName)).map((cell) => renderCellMarkdown(cell)));
+      if (rows.length) {
+        const header = rows[0] || [];
+        const body = rows.slice(1);
+        const columnCount = Math.max(1, ...rows.map((row) => row.length));
+        const normalizeRow = (row) => Array.from({ length: columnCount }, (_v, idx) => String(row[idx] || '').trim());
+        const headerRow = normalizeRow(header);
+        const dividerRow = Array.from({ length: columnCount }, () => '---');
+        result += `| ${headerRow.join(' | ')} |\n| ${dividerRow.join(' | ')} |\n`;
+        body.forEach((row) => {
+          const normalized = normalizeRow(row);
+          result += `| ${normalized.join(' | ')} |\n`;
+        });
+        result += '\n';
+      }
+    }
     else if (tag === 'p' || tag === 'div') {
       const inner = nodesToMarkdown(children).trim();
       if (inner) result += `${inner}\n\n`;
@@ -1584,7 +2558,7 @@ function renderSummary(gen) {
   const ui = gen.ui;
   if (ui.isEditMode) {
     const content = gen.summary
-      .map((section) => `<h2>${escapeHtml(section.subtopic || '')}</h2>${formatMarkdownToHtml(section.content || '')}`)
+      .map((section) => `<h2>${escapeHtml(section.subtopic || '')}</h2>${formatMarkdownToHtmlEditor(section.content || '')}`)
       .join('');
     summaryContainer.innerHTML = `
       <div class="markdown-editor-container">
@@ -1813,20 +2787,23 @@ function renderAnalytics(gen) {
     analyticsContainer.innerHTML = '<div class="status-message">Аналитика появится после обработки</div>';
     return;
   }
-  if (gen.status === 'failed') {
-    analyticsContainer.innerHTML = '<div class="status-message">Аналитика недоступна из-за ошибки генерации.</div>';
-    return;
-  }
-  if (!gen.analytics || !gen.analytics.studentLink) {
-    analyticsContainer.innerHTML = '<div class="status-message">Аналитика появится после обработки</div>';
-    return;
-  }
-
+  const generationFailed = gen.status === 'failed';
+  const analytics = gen.analytics && typeof gen.analytics === 'object'
+    ? gen.analytics
+    : buildAnalytics(gen.id, Array.isArray(gen.quiz) ? gen.quiz : []);
   const link = `${location.origin}/material/${encodeURIComponent(gen.id)}/`;
   const displayLink = link;
-  const completed = Number(gen.analytics.studentsCompleted || 0);
-  const mastery = completed && Array.isArray(gen.analytics.mastery) ? gen.analytics.mastery : [];
-  const recommendations = completed && Array.isArray(gen.analytics.recommendations) ? gen.analytics.recommendations.slice(0, 2) : [];
+  const completed = Number(analytics.studentsCompleted || 0);
+  const mastery = completed && Array.isArray(analytics.mastery) ? analytics.mastery : [];
+  const recommendations = completed && Array.isArray(analytics.recommendations) ? analytics.recommendations.slice(0, 2) : [];
+  const transcriptLines = normalizeTranscriptLines(gen.transcript);
+  const speechAnalysis = buildSpeechAnalysisViewModel(gen);
+  const speechAnalysisError = getSpeechAnalysisError(gen);
+  const speechAnalysisAgeMs = getGenerationAgeMs(gen);
+  const speechAnalysisTimedOut = speechAnalysisAgeMs >= 5 * 60 * 1000;
+  const speechExpanded = getSpeechAnalysisState(gen);
+  const speechRetryPending = Boolean(speechExpanded && speechExpanded.speechAnalysisRetryPending);
+  const rateLimitSpeechError = /rate limit reached/i.test(speechAnalysisError);
   const masteryHtml = mastery
     .map((item) => {
       const percent = Math.max(0, Math.min(100, Number(item.percent || 0)));
@@ -1856,9 +2833,183 @@ function renderAnalytics(gen) {
         `;
       }).join('')
     : '<div class="analytics-reco muted">Слабых подтем пока не найдено.</div>';
+  const speechFragmentsCard = (title, fragments, sectionKey) => {
+    const expanded = Boolean(speechExpanded[sectionKey]);
+    return `
+      <section class="speech-subcard">
+        <div class="speech-subcard-title">${escapeHtml(title)}</div>
+        ${renderSpeechFragmentList(fragments, gen, sectionKey, expanded, transcriptLines)}
+      </section>
+    `;
+  };
+  const speechCommentCard = (comment) => `
+    <section class="speech-subcard speech-subcard-comment">
+      <div class="speech-subcard-title">Комментарий</div>
+      <div class="speech-subcard-text">${escapeHtml(String(comment || '').trim() || 'Комментарий отсутствует.')}</div>
+    </section>
+  `;
+
+  if (!speechAnalysis) {
+    if (speechRetryPending) {
+      analyticsContainer.innerHTML = `
+        <div class="analytics-stack">
+          ${renderSpeechAnalysisLoadingCard(gen, {
+            retry: true,
+            retryDisabled: true,
+            message: 'Повторно запрашиваем анализ речи преподавателя...'
+          })}
+
+          <section class="analytics-card">
+            <div class="analytics-title">Ссылка для учеников</div>
+            <div class="analytics-link-wrap">
+              <div class="analytics-link">${escapeHtml(displayLink)}</div>
+            </div>
+            <div class="analytics-link-actions">
+              <button class="analytics-btn outline" type="button" onclick="openStudentLink('${escapeHtml(link)}')">Перейти</button>
+              <button class="analytics-btn filled" type="button" onclick="handleCopyStudentLink(this, '${escapeHtml(link)}')">Скопировать</button>
+            </div>
+            <div class="analytics-meta">Завершено попыток: ${completed}</div>
+          </section>
+
+          <section class="analytics-card ${completed ? '' : 'analytics-card-disabled'}">
+            <div class="analytics-title">Освоение подтем</div>
+            ${masteryHtml || '<div class="status-message">Результаты появятся после первого выполнения теста учеником.</div>'}
+          </section>
+
+          <section class="analytics-card ${completed ? '' : 'analytics-card-disabled'}">
+            <div class="analytics-title">Рекомендации</div>
+            <div class="analytics-reco-list">${completed ? recommendationsHtml : '<div class="analytics-reco muted">Пока нет данных для рекомендаций.</div>'}</div>
+          </section>
+        </div>
+      `;
+      setTimeout(() => renderMathInContainer(analyticsContainer), 30);
+      return;
+    }
+    if (speechAnalysisError && speechExpanded) {
+      speechExpanded.speechAnalysisRetryPending = false;
+    }
+    const shouldRetry = generationFailed || Boolean(speechAnalysisError) || speechAnalysisTimedOut;
+    const errorMessage = speechAnalysisError
+      ? speechAnalysisError
+      : (generationFailed
+        ? (gen.error_message || 'Аналитика недоступна из-за ошибки генерации.')
+        : (speechAnalysisTimedOut
+        ? 'Анализ речи преподавателя не получен за 5 минут.'
+        : 'Ищем анализ речи преподавателя...'));
+    analyticsContainer.innerHTML = `
+      <div class="analytics-stack">
+        ${ (speechAnalysisError || generationFailed || speechAnalysisTimedOut)
+          ? renderSpeechAnalysisErrorCard(
+              rateLimitSpeechError ? 'Rate limit reached' : errorMessage,
+              { retry: shouldRetry, retryDisabled: false }
+            )
+          : renderSpeechAnalysisLoadingCard(gen, { retry: false, message: 'Ищем анализ речи преподавателя...' })}
+
+        <section class="analytics-card">
+          <div class="analytics-title">Ссылка для учеников</div>
+          <div class="analytics-link-wrap">
+            <div class="analytics-link">${escapeHtml(displayLink)}</div>
+          </div>
+          <div class="analytics-link-actions">
+            <button class="analytics-btn outline" type="button" onclick="openStudentLink('${escapeHtml(link)}')">Перейти</button>
+            <button class="analytics-btn filled" type="button" onclick="handleCopyStudentLink(this, '${escapeHtml(link)}')">Скопировать</button>
+          </div>
+          <div class="analytics-meta">Завершено попыток: ${completed}</div>
+        </section>
+
+        <section class="analytics-card ${completed ? '' : 'analytics-card-disabled'}">
+          <div class="analytics-title">Освоение подтем</div>
+          ${masteryHtml || '<div class="status-message">Результаты появятся после первого выполнения теста учеником.</div>'}
+        </section>
+
+        <section class="analytics-card ${completed ? '' : 'analytics-card-disabled'}">
+          <div class="analytics-title">Рекомендации</div>
+          <div class="analytics-reco-list">${completed ? recommendationsHtml : '<div class="analytics-reco muted">Пока нет данных для рекомендаций.</div>'}</div>
+        </section>
+      </div>
+    `;
+    setTimeout(() => renderMathInContainer(analyticsContainer), 30);
+    return;
+  }
+  const speechGoals = speechAnalysis.structure.goals;
+  if (speechExpanded) {
+    speechExpanded.speechAnalysisRetryPending = false;
+  }
+  const speechAnalysisHtml = `
+    <section class="analytics-card speech-analysis-card">
+      <div class="analytics-title">Анализ речи преподавателя</div>
+      <div class="speech-format-card">
+        <div class="speech-format-label">Формат занятия</div>
+        <div class="speech-format-value">${escapeHtml(speechAnalysis.format.label)}</div>
+        <div class="speech-format-comment">${escapeHtml(speechAnalysis.format.comment)}</div>
+      </div>
+
+      <details class="speech-accordion">
+        <summary>Вовлечение аудитории</summary>
+        <div class="speech-accordion-body">
+          <section class="speech-subcard">
+            <div class="speech-subcard-title">${escapeHtml(speechAnalysis.engagement.questions.title)}</div>
+            ${renderSpeechFragmentList(speechAnalysis.engagement.questions.fragments, gen, 'engagement_questions', Boolean(speechExpanded.engagement_questions), transcriptLines)}
+            ${speechCommentCard(speechAnalysis.engagement.questions.comment)}
+          </section>
+          ${Array.isArray(speechAnalysis.engagement.answers.fragments) && speechAnalysis.engagement.answers.fragments.length
+            ? `
+              <section class="speech-subcard">
+                <div class="speech-subcard-title">${escapeHtml(speechAnalysis.engagement.answers.title)}</div>
+                ${renderSpeechFragmentList(speechAnalysis.engagement.answers.fragments, gen, 'engagement_answers', Boolean(speechExpanded.engagement_answers), transcriptLines)}
+              </section>
+            `
+            : ''}
+        </div>
+      </details>
+
+      <details class="speech-accordion">
+        <summary>Структура занятия</summary>
+        <div class="speech-accordion-body">
+          <div class="speech-subsection-title">${escapeHtml(speechAnalysis.structure.timeline.title)}</div>
+          <div class="speech-timeline">
+            ${renderSpeechTimeline(speechAnalysis.structure.timeline.items)}
+          </div>
+          <div class="speech-subsection-title">${escapeHtml(speechGoals.title)}</div>
+          ${renderSpeechGoal('Введение', speechGoals.introduction)}
+          ${renderSpeechGoal('Завершение', speechGoals.ending)}
+        </div>
+      </details>
+
+      <details class="speech-accordion">
+        <summary>Примеры, аналогии и сторителлинг</summary>
+        <div class="speech-accordion-body">
+          ${renderSpeechFragmentList(speechAnalysis.explanation.fragments, gen, 'explanation', Boolean(speechExpanded.explanation), transcriptLines)}
+        </div>
+      </details>
+
+      <details class="speech-accordion">
+        <summary>Флаги</summary>
+        <div class="speech-accordion-body">
+          ${renderSpeechCheck(speechAnalysis.flags.profanity.title, speechAnalysis.flags.profanity)}
+          ${speechAnalysis.flags.profanity.passed ? renderSpeechFragmentList(speechAnalysis.flags.profanity.fragments, gen, 'flags_profanity', Boolean(speechExpanded.flags_profanity), transcriptLines) : ''}
+          ${renderSpeechCheck(speechAnalysis.flags.familiarity.title, speechAnalysis.flags.familiarity)}
+          ${speechAnalysis.flags.familiarity.passed ? renderSpeechFragmentList(speechAnalysis.flags.familiarity.fragments, gen, 'flags_familiarity', Boolean(speechExpanded.flags_familiarity), transcriptLines) : ''}
+        </div>
+      </details>
+
+      <details class="speech-accordion">
+        <summary>${escapeHtml(speechAnalysis.recommendation.title || 'Рекомендация преподавателю')}</summary>
+        <div class="speech-accordion-body">
+          <div class="speech-subcard-text">${escapeHtml(speechAnalysis.recommendation.comment || 'Комментарий отсутствует.')}</div>
+        </div>
+      </details>
+
+      <div class="speech-analysis-footer">
+        <button type="button" class="speech-export-btn" data-speech-export="true">Экспорт в Excel</button>
+      </div>
+    </section>
+  `;
 
   analyticsContainer.innerHTML = `
     <div class="analytics-stack">
+      ${speechAnalysisHtml}
+
       <section class="analytics-card">
         <div class="analytics-title">Ссылка для учеников</div>
         <div class="analytics-link-wrap">
@@ -1883,6 +3034,48 @@ function renderAnalytics(gen) {
     </div>
   `;
   setTimeout(() => renderMathInContainer(analyticsContainer), 30);
+}
+
+function openSpeechTranscriptFragment(gen, startMs, endMs = null) {
+  if (!gen || startMs === null || startMs === undefined || Number.isNaN(Number(startMs))) return;
+  setActiveTranscriptHighlight(gen, Number(startMs), endMs === null || endMs === undefined ? Number(startMs) : Number(endMs));
+  if (getActiveTab() !== 'transcript') {
+    setActiveTab('transcript', gen);
+  } else {
+    renderTranscript(gen);
+  }
+  requestAnimationFrame(() => {
+    requestAnimationFrame(scrollToActiveTranscriptHighlight);
+  });
+}
+
+function renderSpeechAnalysisLoadingCard(gen, { retry = false, retryDisabled = false, message = '' } = {}) {
+  const retryButton = retry
+    ? `<div class="speech-analysis-action"><button type="button" class="speech-export-btn" data-speech-retry="true" ${retryDisabled ? 'disabled aria-disabled="true"' : ''}>Попробовать снова</button></div>`
+    : '';
+  return `
+    <section class="analytics-card speech-analysis-card">
+      <div class="analytics-title">Анализ речи преподавателя</div>
+      <div class="speech-analysis-loader">
+        <div class="spinner-small"></div>
+        <div class="speech-analysis-loader-text">${escapeHtml(message || 'Ищем анализ речи преподавателя...')}</div>
+      </div>
+      ${retryButton}
+    </section>
+  `;
+}
+
+function renderSpeechAnalysisErrorCard(message, { retry = false, retryDisabled = false } = {}) {
+  const retryButton = retry
+    ? `<div class="speech-analysis-action"><button type="button" class="speech-export-btn" data-speech-retry="true" ${retryDisabled ? 'disabled aria-disabled="true"' : ''}>Попробовать снова</button></div>`
+    : '';
+  return `
+    <section class="analytics-card speech-analysis-card">
+      <div class="analytics-title">Анализ речи преподавателя</div>
+      <div class="status-message status-message-error">${escapeHtml(String(message || 'Не удалось получить анализ речи преподавателя.'))}</div>
+      ${retryButton}
+    </section>
+  `;
 }
 
 function renderActiveGeneration() {
@@ -2131,13 +3324,34 @@ async function saveQuizEdit() {
 window.retryGeneration = async function retryGeneration() {
   const gen = getActiveGeneration();
   if (!gen || gen.status === 'processing') return;
+  const previousStatus = gen.status;
+  const hasSummaryAndQuiz = Array.isArray(gen.summary) && gen.summary.length > 0 && Array.isArray(gen.quiz) && gen.quiz.length > 0;
+  const speechState = getSpeechAnalysisState(gen);
+  if (speechState) {
+    speechState.speechAnalysisRetryPending = true;
+  }
+  if (!hasSummaryAndQuiz) {
+    gen.status = 'processing';
+  }
+  gen.error_message = '';
+  renderActiveGeneration();
   try {
     await api(`/api/generations/${gen.id}/retry`, { method: 'POST' });
-    gen.status = 'processing';
     gen.error_message = '';
+    if (!hasSummaryAndQuiz) {
+      gen.status = 'processing';
+    }
+    await refreshGenerationById(gen.id).catch(() => {});
+    if (speechState) {
+      speechState.speechAnalysisRetryPending = false;
+    }
     renderActiveGeneration();
-    setTimeout(() => refresh().catch(() => {}), 700);
   } catch (e) {
+    if (speechState) {
+      speechState.speechAnalysisRetryPending = false;
+    }
+    gen.status = previousStatus;
+    renderActiveGeneration();
     showPopover(e.message || 'Не удалось запустить повторную генерацию.');
   }
 };
@@ -2284,6 +3498,41 @@ function bindEvents() {
 
   if (transcriptJumpBtn) {
     transcriptJumpBtn.addEventListener('click', scrollTranscriptToBottom);
+  }
+
+  if (analyticsContainer) {
+    analyticsContainer.addEventListener('toggle', (event) => {
+      const accordion = event.target;
+      if (!accordion || !accordion.classList || !accordion.classList.contains('speech-accordion')) return;
+      if (!accordion.open) return;
+      analyticsContainer.querySelectorAll('details.speech-accordion[open]').forEach((otherAccordion) => {
+        if (otherAccordion !== accordion) otherAccordion.open = false;
+      });
+    }, true);
+
+    analyticsContainer.addEventListener('click', (event) => {
+      const retryBtn = event.target.closest('[data-speech-retry="true"]');
+      if (retryBtn) {
+        retryGeneration();
+        return;
+      }
+
+      const exportBtn = event.target.closest('[data-speech-export="true"]');
+      if (exportBtn) {
+        const gen = getActiveGeneration();
+        exportSpeechAnalysisToExcel(gen);
+        return;
+      }
+
+      const fragmentBtn = event.target.closest('[data-speech-fragment="true"]');
+      if (fragmentBtn) {
+        const gen = getActiveGeneration();
+        const startMs = fragmentBtn.getAttribute('data-speech-start-ms');
+        const endMs = fragmentBtn.getAttribute('data-speech-end-ms');
+        openSpeechTranscriptFragment(gen, startMs, endMs);
+        return;
+      }
+    });
   }
 }
 
