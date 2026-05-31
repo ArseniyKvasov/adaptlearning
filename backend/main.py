@@ -2549,17 +2549,18 @@ def build_speech_analysis_export_worksheets_precise(generation: dict[str, Any]) 
             ],
             "height": 26,
         })
-    if total_questions and total_answers:
-        engagement_rows.append({
-            "cells": [
-                {"value": "Создание благоприятной атмосферы", "style": 14},
-                {"value": "Ответы студентов", "style": 5},
-                {"value": f"{total_answers} из {total_questions} ({percentage(total_answers, total_questions)})", "style": 5},
-                {"value": point(atmosphere_points(total_answers, total_questions)), "style": 12 if atmosphere_points(total_answers, total_questions) == 1 else 13 if atmosphere_points(total_answers, total_questions) == 2 else 11},
-                {"value": join_comments(answers_fragments), "style": 5},
-            ],
-            "height": 26,
-        })
+    answers_comment = join_comments(answers_fragments) if answers_fragments else "Ответов студентов не было."
+    atmosphere_score = atmosphere_points(total_answers, total_questions)
+    engagement_rows.append({
+        "cells": [
+            {"value": "Ответы студентов", "style": 14},
+            {"value": "Ответы студентов", "style": 5},
+            {"value": f"{total_answers} из {total_questions} ({percentage(total_answers, total_questions)})", "style": 5},
+            {"value": point(atmosphere_score), "style": 12 if atmosphere_score == 1 else 13 if atmosphere_score == 2 else 11},
+            {"value": answers_comment, "style": 5},
+        ],
+        "height": 26,
+    })
     add_section("Вовлечение аудитории", engagement_rows)
 
     structure_rows: list[dict[str, Any]] = []
