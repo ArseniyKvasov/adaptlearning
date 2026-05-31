@@ -17,6 +17,45 @@ def _fix_json_escapes(text: str) -> str:
     return text.replace("\x0c", "\\f").replace("\x0d", "\\r")
 
 
+_QUESTION_TYPE_TO_CANONICAL = {
+    "rhetorical": "rhetorical",
+    "риторический": "rhetorical",
+    "checking_understanding": "checking_understanding",
+    "проверка понимания": "checking_understanding",
+    "quiz": "quiz",
+    "викторина": "quiz",
+    "clarifying": "clarifying",
+    "уточняющий": "clarifying",
+    "open_ended": "open_ended",
+    "open-ended": "open_ended",
+    "открытый": "open_ended",
+    "factual": "factual",
+    "фактический": "factual",
+    "other": "other",
+    "другой": "other",
+}
+
+_QUESTION_TYPE_TO_RUSSIAN = {
+    "rhetorical": "риторический",
+    "checking_understanding": "проверка понимания",
+    "quiz": "викторина",
+    "clarifying": "уточняющий",
+    "open_ended": "открытый",
+    "factual": "фактический",
+    "other": "другой",
+}
+
+
+def _canonical_question_type(value: Any) -> str:
+    normalized = str(value or "").strip().casefold()
+    return _QUESTION_TYPE_TO_CANONICAL.get(normalized, "")
+
+
+def _russian_question_type(value: Any) -> str:
+    canonical = _canonical_question_type(value)
+    return _QUESTION_TYPE_TO_RUSSIAN.get(canonical, "")
+
+
 class MLServiceClient:
     def __init__(self, api_key: str, base_url: str = "https://ml.fastclass.ru") -> None:
         self.api_key = api_key
@@ -35,7 +74,7 @@ class MLServiceClient:
     @staticmethod
     def _http_user_message(status_code: int) -> str:
         if status_code == 429:
-            return "ML-сервис временно перегружен. Попробуйте повторить запуск через минуту."
+            return "Rate limit reached"
         if status_code in (401, 403):
             return "ML-сервис отклонил доступ. Проверьте настройки ключа."
         if status_code >= 500:
@@ -313,15 +352,153 @@ class MLServiceClient:
         }
 
     async def make_mini_summary(self, chunk_transcript: dict[str, Any]) -> dict[str, Any]:
-        last_error: Exception = MLServiceError("Mini-summary failed", "Не удалось сгенерировать мини-конспект.")
-        for attempt in range(1, 3):
+        return await self._make_mini_summary_once(chunk_transcript)
+
+    @staticmethod
+    def _normalize_teacher_analysis_fragment(item: Any) -> dict[str, Any]:
+        if not isinstance(item, dict):
+            return {"start_ms": 0, "end_ms": 0, "text": ""}
+        try:
+            start_value = int(item.get("start_ms", 0) or 0)
+        except (TypeError, ValueError):
+            start_value = 0
+        try:
+            end_value = int(item.get("end_ms", start_value) or start_value)
+        except (TypeError, ValueError):
+            end_value = start_value
+        if end_value < start_value:
+            end_value = start_value
+        fragment_type = str(item.get("type") or "").strip()
+        question_type = _canonical_question_type(item.get("question_type"))
+        if not question_type and str(item.get("question_type") or "").strip():
+            question_type = "other"
+        normalized = {
+            "start_ms": start_value,
+            "end_ms": end_value,
+            "text": _fix_json_escapes(str(item.get("text") or "").strip()),
+            **({"type": fragment_type} if fragment_type else {}),
+        }
+        if question_type:
+            normalized["question_type"] = question_type
+        return normalized
+
+    @staticmethod
+    def _localize_teacher_analysis_chunk_for_aggregate(item: Any) -> dict[str, Any]:
+        if not isinstance(item, dict):
+            return {}
+        localized = dict(item)
+        questions = localized.get("teacher_questions")
+        if isinstance(questions, list):
+            localized_questions: list[dict[str, Any]] = []
+            for question in questions:
+                if not isinstance(question, dict):
+                    continue
+                question_copy = dict(question)
+                russian_type = _russian_question_type(question_copy.get("question_type"))
+                if russian_type:
+                    question_copy["question_type"] = russian_type
+                elif "question_type" in question_copy:
+                    question_copy.pop("question_type", None)
+                localized_questions.append(question_copy)
+            localized["teacher_questions"] = localized_questions
+        return localized
+
+    @staticmethod
+    def _normalize_teacher_analysis_chunk(item: Any) -> dict[str, Any]:
+        if not isinstance(item, dict):
+            return {}
+
+        def normalize_list(value: Any) -> list[dict[str, Any]]:
+            return [
+                MLServiceClient._normalize_teacher_analysis_fragment(fragment)
+                for fragment in value
+                if isinstance(value, list) and isinstance(fragment, dict) and str(fragment.get("text") or "").strip()
+            ] if isinstance(value, list) else []
+
+        lesson_events: list[dict[str, Any]] = []
+        raw_events = item.get("lesson_events")
+        if isinstance(raw_events, list):
+            for event in raw_events:
+                if not isinstance(event, dict):
+                    continue
+                try:
+                    start_value = int(event.get("start_ms", 0) or 0)
+                except (TypeError, ValueError):
+                    start_value = 0
+                lesson_events.append(
+                    {
+                        "start_ms": start_value,
+                        "title": _fix_json_escapes(str(event.get("title") or "").strip()),
+                        "description": _fix_json_escapes(str(event.get("description") or "").strip()),
+                    }
+                )
+
+        goals = item.get("goals_and_summary") if isinstance(item.get("goals_and_summary"), dict) else {}
+        intro = goals.get("intro") if isinstance(goals, dict) and isinstance(goals.get("intro"), dict) else {}
+        summary = goals.get("summary") if isinstance(goals, dict) and isinstance(goals.get("summary"), dict) else {}
+
+        def normalize_goal(goal: Any) -> dict[str, Any]:
+            if not isinstance(goal, dict):
+                return {"present": False, "start_ms": None, "comment": ""}
+            start_raw = goal.get("start_ms", None)
             try:
-                return await self._make_mini_summary_once(chunk_transcript)
-            except MLServiceError as e:
-                last_error = e
-                print(f"[make_mini_summary] attempt {attempt} failed, retrying...")
-                await asyncio.sleep(1.5 * attempt)
-        raise last_error
+                start_value = int(start_raw) if start_raw is not None else None
+            except (TypeError, ValueError):
+                start_value = None
+            return {
+                "present": bool(goal.get("present")),
+                "start_ms": start_value,
+                "comment": _fix_json_escapes(str(goal.get("comment") or "").strip()),
+            }
+
+        flags = item.get("flags") if isinstance(item.get("flags"), dict) else {}
+
+        return {
+            "chunk_id": int(item.get("chunk_id", 0) or 0),
+            "start_time": str(item.get("start_time") or "").strip(),
+            "end_time": str(item.get("end_time") or "").strip(),
+            "teacher_questions": normalize_list(item.get("teacher_questions")),
+            "student_answers": normalize_list(item.get("student_answers")),
+            "examples_and_analogies": normalize_list(item.get("examples_and_analogies")),
+            "lesson_events": lesson_events,
+            "goals_and_summary": {
+                "intro": normalize_goal(intro),
+                "summary": normalize_goal(summary),
+            },
+            "flags": {
+                "profanity": normalize_list(flags.get("profanity")),
+                "overly_familiar_tone": normalize_list(flags.get("overly_familiar_tone")),
+            },
+        }
+
+    async def _make_teacher_analysis_once(self, chunk_transcript: dict[str, Any]) -> dict[str, Any]:
+        task = await self._submit_task("/teacher-analysis", chunk_transcript, timeout_s=180)
+        task = await self._wait_for_task(task, timeout_s=3600)
+        data = self._task_result(task)
+        normalized = self._normalize_teacher_analysis_chunk(data)
+        if not normalized:
+          raise MLServiceError("Teacher analysis response is empty", "Сервис вернул пустой анализ речи преподавателя. Попробуйте повторить генерацию.")
+        return normalized
+
+    async def make_teacher_analysis(self, chunk_transcript: dict[str, Any]) -> dict[str, Any]:
+        return await self._make_teacher_analysis_once(chunk_transcript)
+
+    async def _make_teacher_analysis_aggregate_once(self, chunk_analyses: list[dict[str, Any]]) -> dict[str, Any]:
+        payload = {
+            "chunk_analyses": [self._localize_teacher_analysis_chunk_for_aggregate(chunk) for chunk in chunk_analyses],
+        }
+        task = await self._submit_task("/teacher-analysis-aggregate", payload, timeout_s=240)
+        task = await self._wait_for_task(task, timeout_s=3600)
+        data = self._task_result(task)
+        if not isinstance(data, dict) or not data:
+            raise MLServiceError(
+                "Teacher analysis aggregate response is empty",
+                "Сервис вернул пустой агрегированный анализ речи преподавателя. Попробуйте повторить генерацию.",
+            )
+        return data
+
+    async def make_teacher_analysis_aggregate(self, chunk_analyses: list[dict[str, Any]]) -> dict[str, Any]:
+        return await self._make_teacher_analysis_aggregate_once(chunk_analyses)
 
     async def _make_lesson_summary_once(self, mini_summaries: list[dict[str, Any]], topic_hint: str = "") -> list[dict[str, Any]]:
         key_points: list[str] = []
@@ -362,16 +539,7 @@ class MLServiceClient:
         return normalized
 
     async def make_lesson_summary(self, mini_summaries: list[dict[str, Any]], topic_hint: str = "") -> list[dict[str, Any]]:
-        last_error: Exception = MLServiceError("Lesson summary failed", "Не удалось сгенерировать конспект.")
-        for attempt in range(1, 4):
-            try:
-                return await self._make_lesson_summary_once(mini_summaries, topic_hint)
-            except MLServiceError as e:
-                last_error = e
-                print(f"[make_lesson_summary] attempt {attempt} failed, retrying...")
-                if attempt < 3:
-                    await asyncio.sleep(1.5 * attempt)
-        raise last_error
+        return await self._make_lesson_summary_once(mini_summaries, topic_hint)
 
     async def make_practice_summary(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
         task = await self._submit_task("/practice-summary", payload, timeout_s=180)

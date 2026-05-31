@@ -7,6 +7,7 @@ import random
 import sqlite3
 import subprocess
 import tempfile
+from io import BytesIO
 import uuid
 import asyncio
 import hashlib
@@ -14,10 +15,12 @@ import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
+from zipfile import ZIP_DEFLATED, ZipFile
+from xml.sax.saxutils import escape as xml_escape
 
 from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
 from backend.ml_service import MLServiceClient, MLServiceError
@@ -38,6 +41,10 @@ AUDIO_CHUNK_MAX_SECONDS = int(os.getenv("AUDIO_CHUNK_MAX_SECONDS", "600"))
 AUDIO_CHUNK_OVERLAP_SECONDS = int(os.getenv("AUDIO_CHUNK_OVERLAP_SECONDS", "0"))
 AUDIO_SILENCE_NOISE_DB = os.getenv("AUDIO_SILENCE_NOISE_DB", "-35dB")
 AUDIO_SILENCE_MIN_SECONDS = float(os.getenv("AUDIO_SILENCE_MIN_SECONDS", "0.7"))
+SPEECH_ANALYSIS_GROUP_TARGET_SECONDS = int(os.getenv("SPEECH_ANALYSIS_GROUP_TARGET_SECONDS", str(7 * 60)))
+SPEECH_ANALYSIS_GROUP_MIN_SECONDS = int(os.getenv("SPEECH_ANALYSIS_GROUP_MIN_SECONDS", str(6 * 60)))
+SPEECH_ANALYSIS_GROUP_MAX_SECONDS = int(os.getenv("SPEECH_ANALYSIS_GROUP_MAX_SECONDS", str(8 * 60)))
+SPEECH_ANALYSIS_GROUP_OVERLAP_PHRASES = int(os.getenv("SPEECH_ANALYSIS_GROUP_OVERLAP_PHRASES", "3"))
 TRANSCRIBE_BATCH_SIZE = max(1, int(os.getenv("TRANSCRIBE_BATCH_SIZE", "2")))
 
 app = FastAPI()
@@ -923,10 +930,13 @@ def make_user_error_message(exc: Exception) -> str:
     if isinstance(exc, MediaConversionError):
         return "Не удалось подготовить аудио из файла. Проверьте формат файла или попробуйте другой файл."
     if isinstance(exc, MLServiceError):
+        combined = f"{exc.user_message} {exc}".lower()
+        if "429" in combined or "rate" in combined:
+            return "Rate limit reached"
         return exc.user_message
     text = str(exc).lower()
     if "rate" in text or "429" in text:
-        return "Сервис временно перегружен. Попробуйте повторить генерацию через минуту."
+        return "Rate limit reached"
     if "timeout" in text:
         return "Превышено время ожидания ответа сервиса. Попробуйте позже."
     return "Не удалось завершить генерацию. Попробуйте позже."
@@ -1188,13 +1198,1474 @@ async def broadcast_to_user(user_id: str, payload: dict[str, Any]) -> None:
             WS_CONNECTIONS.get(user_id, set()).discard(ws)
 
 
-def build_analytics(generation_id: str, quiz: list[dict[str, Any]]) -> dict[str, Any]:
-    return {
+def build_analytics(
+    generation_id: str,
+    quiz: list[dict[str, Any]],
+    speech_analysis: Optional[dict[str, Any]] = None,
+    speech_analysis_error: str = "",
+) -> dict[str, Any]:
+    analytics = {
         "studentLink": f"/material/{generation_id}/",
         "studentsCompleted": 0,
         "mastery": [],
         "recommendations": [],
     }
+    if isinstance(speech_analysis, dict) and speech_analysis:
+        analytics["speech_analysis"] = speech_analysis
+    if str(speech_analysis_error or "").strip():
+        analytics["speech_analysis_error"] = str(speech_analysis_error).strip()
+    return analytics
+
+
+def merge_speech_analysis_into_analytics(analytics: dict[str, Any], speech_analysis: Optional[dict[str, Any]]) -> dict[str, Any]:
+    merged = dict(analytics or {})
+    if isinstance(speech_analysis, dict) and speech_analysis:
+        merged["speech_analysis"] = speech_analysis
+    return merged
+
+
+def speech_analysis_from_generation(generation: dict[str, Any]) -> dict[str, Any]:
+    analytics = generation.get("analytics") if isinstance(generation.get("analytics"), dict) else {}
+    speech_analysis = analytics.get("speech_analysis") if isinstance(analytics, dict) else {}
+    return speech_analysis if isinstance(speech_analysis, dict) else {}
+
+
+def transcript_line_by_start_ms(transcript: list[dict[str, Any]], start_ms: Any) -> Optional[dict[str, Any]]:
+    try:
+        target = int(start_ms)
+    except (TypeError, ValueError):
+        return None
+    for line in transcript:
+        if not isinstance(line, dict):
+            continue
+        try:
+            line_start = int(line.get("start_ms", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if line_start == target:
+            return line
+    return None
+
+
+def transcript_lines_by_ms_range(
+    transcript: list[dict[str, Any]],
+    start_ms: Any,
+    end_ms: Any = None,
+) -> list[dict[str, Any]]:
+    try:
+        start_value = int(start_ms)
+    except (TypeError, ValueError):
+        return []
+    try:
+        end_value = int(end_ms if end_ms is not None else start_value)
+    except (TypeError, ValueError):
+        end_value = start_value
+    if end_value < start_value:
+        start_value, end_value = end_value, start_value
+    matches: list[dict[str, Any]] = []
+    for line in transcript:
+        if not isinstance(line, dict):
+            continue
+        try:
+            line_start = int(line.get("start_ms", 0) or 0)
+        except (TypeError, ValueError):
+            continue
+        if start_value <= line_start <= end_value:
+            matches.append(line)
+    return matches
+
+
+def xlsx_column_name(index: int) -> str:
+    name = ""
+    index = max(1, index)
+    while index:
+        index, remainder = divmod(index - 1, 26)
+        name = chr(65 + remainder) + name
+    return name
+
+
+def xlsx_escape_text(value: Any) -> str:
+    return xml_escape(str(value if value is not None else ""), {'"': '&quot;', "'": '&apos;'})
+
+
+def sanitize_xlsx_sheet_name(name: str, fallback: str = "Лист") -> str:
+    cleaned = re.sub(r"[\[\]\*\/\\\?:]", " ", str(name or fallback))
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = cleaned[:31]
+    return cleaned or fallback
+
+
+def normalize_speech_title(title: Any) -> str:
+    value = str(title or "").strip()
+    if value == "Преподаватель активно задаёт вопросы студентам":
+        return "Вопросы преподавателя"
+    if value == "Преподаватель реагирует на ответы студентов и развивает обсуждение":
+        return "Ответы студентов"
+    return value
+
+
+def xlsx_cell_xml(value: Any, row_num: int, col_num: int, *, style_id: Optional[int] = None) -> str:
+    cell_ref = f"{xlsx_column_name(col_num)}{row_num}"
+    style_attr = f' s="{style_id}"' if style_id is not None else ""
+    text = xlsx_escape_text(value)
+    return f'<c r="{cell_ref}" t="inlineStr"{style_attr}><is><t xml:space="preserve">{text}</t></is></c>'
+
+
+def build_xlsx_sheet_xml(sheet: dict[str, Any]) -> str:
+    def normalize_cell(cell: Any) -> dict[str, Any]:
+        if isinstance(cell, dict):
+            span_raw = cell.get("span", 1)
+            try:
+                span = max(1, int(span_raw or 1))
+            except (TypeError, ValueError):
+                span = 1
+            return {
+                "value": cell.get("value", ""),
+                "style": cell.get("style"),
+                "span": span,
+            }
+        return {"value": cell, "style": None, "span": 1}
+
+    def normalize_row(row: Any) -> dict[str, Any]:
+        if isinstance(row, dict):
+            cells = row.get("cells")
+            if not isinstance(cells, list):
+                cells = [cells] if cells is not None else []
+            return {"cells": cells, "height": row.get("height")}
+        if isinstance(row, list):
+            return {"cells": row, "height": None}
+        return {"cells": [row], "height": None}
+
+    rows = sheet.get("rows") if isinstance(sheet.get("rows"), list) else []
+    columns = sheet.get("cols") if isinstance(sheet.get("cols"), list) else []
+    page_setup = sheet.get("page_setup") if isinstance(sheet.get("page_setup"), dict) else {}
+
+    row_xml: list[str] = []
+    merge_refs: list[str] = []
+    max_cols = max(1, len(columns))
+
+    for row_num, row in enumerate(rows, start=1):
+        row_spec = normalize_row(row)
+        cells = []
+        col_num = 1
+        for cell in row_spec["cells"]:
+            cell_spec = normalize_cell(cell)
+            span = int(cell_spec["span"] or 1)
+            cells.append(xlsx_cell_xml(cell_spec["value"], row_num, col_num, style_id=cell_spec["style"]))
+            if span > 1:
+                merge_refs.append(f'{xlsx_column_name(col_num)}{row_num}:{xlsx_column_name(col_num + span - 1)}{row_num}')
+            col_num += span
+        max_cols = max(max_cols, col_num - 1)
+        row_attr = f' r="{row_num}"'
+        if row_spec["height"] is not None:
+            row_attr += f' ht="{row_spec["height"]}" customHeight="1"'
+        row_xml.append(f'<row{row_attr}>{"".join(cells)}</row>')
+
+    dimension = f"A1:{xlsx_column_name(max_cols)}{max(1, len(rows))}"
+    cols_xml = ''
+    if columns:
+        cols_xml = '<cols>' + ''.join(
+            f'<col min="{index}" max="{index}" width="{float(width):.2f}" customWidth="1"/>'
+            for index, width in enumerate(columns, start=1)
+        ) + '</cols>'
+    merge_xml = ''
+    if merge_refs:
+        merge_xml = f'<mergeCells count="{len(merge_refs)}">' + ''.join(f'<mergeCell ref="{ref}"/>' for ref in merge_refs) + '</mergeCells>'
+
+    orientation = str(page_setup.get("orientation") or "landscape")
+    paper_size = int(page_setup.get("paperSize") or 9)
+    fit_width = int(page_setup.get("fitToWidth") or 1)
+    fit_height = int(page_setup.get("fitToHeight") or 1)
+
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" '
+        'xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
+        '<sheetPr><pageSetUpPr fitToPage="1"/></sheetPr>'
+        f'<dimension ref="{dimension}"/>'
+        '<sheetViews><sheetView workbookViewId="0"><selection activeCell="A1" sqref="A1"/></sheetView></sheetViews>'
+        '<sheetFormatPr defaultRowHeight="18"/>'
+        f'{cols_xml}'
+        '<sheetData>'
+        + "".join(row_xml)
+        + '</sheetData>'
+        f'{merge_xml}'
+        '<printOptions horizontalCentered="0" verticalCentered="0" headings="0" gridLines="0"/>'
+        '<pageMargins left="0.35" right="0.35" top="0.45" bottom="0.45" header="0.2" footer="0.2"/>'
+        f'<pageSetup orientation="{orientation}" paperSize="{paper_size}" fitToWidth="{fit_width}" fitToHeight="{fit_height}"/>'
+        '</worksheet>'
+    )
+
+
+def build_xlsx_styles_xml() -> str:
+    return (
+        '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
+        '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">'
+        '<fonts count="6">'
+        '<font><sz val="10"/><color rgb="FF1E293B"/><name val="Arial"/><family val="2"/></font>'
+        '<font><b/><sz val="10"/><color rgb="FFFFFFFF"/><name val="Arial"/><family val="2"/></font>'
+        '<font><b/><sz val="11"/><color rgb="FF0F172A"/><name val="Arial"/><family val="2"/></font>'
+        '<font><i/><sz val="10"/><color rgb="FF64748B"/><name val="Arial"/><family val="2"/></font>'
+        '<font><b/><sz val="14"/><color rgb="FF0F172A"/><name val="Arial"/><family val="2"/></font>'
+        '<font><b/><sz val="12"/><color rgb="FF0F172A"/><name val="Arial"/><family val="2"/></font>'
+        '</fonts>'
+        '<fills count="4">'
+        '<fill><patternFill patternType="none"/></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FF0F766E"/><bgColor indexed="64"/></patternFill></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFEFF6FF"/><bgColor indexed="64"/></patternFill></fill>'
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFF8FAFC"/><bgColor indexed="64"/></patternFill></fill>'
+        '</fills>'
+        '<borders count="2">'
+        '<border><left/><right/><top/><bottom/><diagonal/></border>'
+        '<border>'
+        '<left style="thin"><color rgb="FFD9E2EC"/></left>'
+        '<right style="thin"><color rgb="FFD9E2EC"/></right>'
+        '<top style="thin"><color rgb="FFD9E2EC"/></top>'
+        '<bottom style="thin"><color rgb="FFD9E2EC"/></bottom>'
+        '<diagonal/>'
+        '</border>'
+        '</borders>'
+        '<cellStyleXfs count="1">'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="0"/>'
+        '</cellStyleXfs>'
+        '<cellXfs count="6">'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>'
+        '<xf numFmtId="0" fontId="1" fillId="1" borderId="1" xfId="0" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>'
+        '<xf numFmtId="0" fontId="4" fillId="3" borderId="1" xfId="0" applyAlignment="1"><alignment vertical="center" wrapText="1"/></xf>'
+        '<xf numFmtId="0" fontId="5" fillId="2" borderId="1" xfId="0" applyAlignment="1"><alignment vertical="center" wrapText="1"/></xf>'
+        '<xf numFmtId="0" fontId="0" fillId="3" borderId="1" xfId="0" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>'
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>'
+        '</cellXfs>'
+        '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>'
+        '</styleSheet>'
+    )
+
+
+def build_xlsx_bytes(worksheets: list[dict[str, Any]]) -> bytes:
+    from openpyxl import Workbook
+    from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
+    from openpyxl.utils import get_column_letter
+
+    unique_sheets: list[dict[str, Any]] = []
+    used_names: set[str] = set()
+    for index, sheet in enumerate(worksheets, start=1):
+        base_name = sanitize_xlsx_sheet_name(str(sheet.get("name") or f"Лист {index}"))
+        name = base_name
+        suffix = 2
+        while name in used_names:
+            trimmed = base_name[: max(1, 31 - len(f" ({suffix})"))].rstrip()
+            name = f"{trimmed} ({suffix})"[:31]
+            suffix += 1
+        used_names.add(name)
+        unique_sheets.append({
+            "name": name,
+            "rows": sheet.get("rows") if isinstance(sheet.get("rows"), list) else [],
+            "cols": sheet.get("cols") if isinstance(sheet.get("cols"), list) else [],
+            "page_setup": sheet.get("page_setup") if isinstance(sheet.get("page_setup"), dict) else {},
+            "freeze_panes": sheet.get("freeze_panes") if isinstance(sheet.get("freeze_panes"), str) else "",
+        })
+
+    wb = Workbook()
+    wb.remove(wb.active)
+    wb.properties.creator = "FastClass"
+    wb.properties.lastModifiedBy = "FastClass"
+
+    thin = Side(style="thin", color="FFD9E2EC")
+    border = Border(left=thin, right=thin, top=thin, bottom=thin)
+
+    header_fill = PatternFill(fill_type="solid", fgColor="FFD9EAF7")
+    title_fill = PatternFill(fill_type="solid", fgColor="FFC7DDF4")
+    note_fill = PatternFill(fill_type="solid", fgColor="FFF8EFB6")
+    sub_fill = PatternFill(fill_type="solid", fgColor="FFF1F5F9")
+    section_blue_fill = PatternFill(fill_type="solid", fgColor="FFE8F1FF")
+    section_green_fill = PatternFill(fill_type="solid", fgColor="FFE9F9EE")
+    section_purple_fill = PatternFill(fill_type="solid", fgColor="FFF0E9FF")
+    section_orange_fill = PatternFill(fill_type="solid", fgColor="FFFFEFE3")
+    score_red_fill = PatternFill(fill_type="solid", fgColor="FFE76F61")
+    score_orange_fill = PatternFill(fill_type="solid", fgColor="FFF2B28F")
+    score_green_fill = PatternFill(fill_type="solid", fgColor="FF87C88D")
+    score_gray_fill = PatternFill(fill_type="solid", fgColor="FFE5E7EB")
+    header_text_fill = PatternFill(fill_type="solid", fgColor="FFFCE7D2")
+
+    styles = {
+        0: {
+            "font": Font(name="Arial", size=10, color="FF1E293B"),
+            "fill": PatternFill(fill_type=None),
+            "alignment": Alignment(vertical="top", wrap_text=True),
+        },
+        1: {
+            "font": Font(name="Arial", size=10, bold=True, color="FF0F172A"),
+            "fill": header_fill,
+            "alignment": Alignment(horizontal="center", vertical="center", wrap_text=True),
+        },
+        2: {
+            "font": Font(name="Arial", size=14, bold=True, color="FF0F172A"),
+            "fill": title_fill,
+            "alignment": Alignment(horizontal="center", vertical="center", wrap_text=True),
+        },
+        3: {
+            "font": Font(name="Arial", size=10, italic=True, color="FF64748B"),
+            "fill": note_fill,
+            "alignment": Alignment(vertical="top", wrap_text=True),
+        },
+        4: {
+            "font": Font(name="Arial", size=10, bold=True, color="FF0F172A"),
+            "fill": sub_fill,
+            "alignment": Alignment(vertical="center", wrap_text=True),
+        },
+        5: {
+            "font": Font(name="Arial", size=10, color="FF1E293B"),
+            "fill": PatternFill(fill_type=None),
+            "alignment": Alignment(vertical="top", wrap_text=True),
+        },
+        6: {
+            "font": Font(name="Arial", size=10, bold=True, color="FF0F172A"),
+            "fill": header_text_fill,
+            "alignment": Alignment(horizontal="center", vertical="center", wrap_text=True),
+        },
+        7: {
+            "font": Font(name="Arial", size=9, italic=True, color="FF1F2937"),
+            "fill": note_fill,
+            "alignment": Alignment(vertical="top", wrap_text=True),
+        },
+        8: {
+            "font": Font(name="Arial", size=10, bold=True, color="FF0F172A"),
+            "fill": section_blue_fill,
+            "alignment": Alignment(vertical="center", wrap_text=True),
+        },
+        9: {
+            "font": Font(name="Arial", size=10, bold=True, color="FF0F172A"),
+            "fill": section_green_fill,
+            "alignment": Alignment(vertical="center", wrap_text=True),
+        },
+        10: {
+            "font": Font(name="Arial", size=10, bold=True, color="FF0F172A"),
+            "fill": section_purple_fill,
+            "alignment": Alignment(vertical="center", wrap_text=True),
+        },
+        11: {
+            "font": Font(name="Arial", size=11, bold=True, color="FFFFFFFF"),
+            "fill": score_red_fill,
+            "alignment": Alignment(horizontal="center", vertical="center", wrap_text=True),
+        },
+        12: {
+            "font": Font(name="Arial", size=11, bold=True, color="FF1F2937"),
+            "fill": score_orange_fill,
+            "alignment": Alignment(horizontal="center", vertical="center", wrap_text=True),
+        },
+        13: {
+            "font": Font(name="Arial", size=11, bold=True, color="FFFFFFFF"),
+            "fill": score_green_fill,
+            "alignment": Alignment(horizontal="center", vertical="center", wrap_text=True),
+        },
+        14: {
+            "font": Font(name="Arial", size=10, bold=True, color="FF0F172A"),
+            "fill": score_gray_fill,
+            "alignment": Alignment(vertical="center", wrap_text=True),
+        },
+        15: {
+            "font": Font(name="Arial", size=10, bold=True, color="FF0F172A"),
+            "fill": PatternFill(fill_type=None),
+            "alignment": Alignment(vertical="center", wrap_text=True),
+        },
+    }
+
+    def apply_style(cell, style_id: Optional[int]) -> None:
+        spec = styles.get(int(style_id) if style_id is not None else 0, styles[0])
+        cell.font = spec["font"]
+        cell.fill = spec["fill"]
+        cell.alignment = spec["alignment"]
+        cell.border = border
+
+    for sheet in unique_sheets:
+        ws = wb.create_sheet(title=sheet["name"])
+        ws.sheet_view.showGridLines = False
+        ws.sheet_properties.pageSetUpPr.fitToPage = True
+        ws.page_setup.orientation = "landscape"
+        ws.page_setup.paperSize = 9
+        ws.page_setup.fitToWidth = 1
+        ws.page_setup.fitToHeight = 1
+        ws.page_margins.left = 0.35
+        ws.page_margins.right = 0.35
+        ws.page_margins.top = 0.45
+        ws.page_margins.bottom = 0.45
+        ws.page_margins.header = 0.2
+        ws.page_margins.footer = 0.2
+
+        rows = sheet["rows"]
+        max_cols = max(6, len(sheet.get("cols") or []))
+        text_widths = [12.0] * max_cols
+
+        for row_num, row in enumerate(rows, start=1):
+            row_spec = row if isinstance(row, dict) else {"cells": row if isinstance(row, list) else [row], "height": None}
+            cells = row_spec.get("cells")
+            if not isinstance(cells, list):
+                cells = [cells] if cells is not None else []
+            if row_spec.get("height") is not None:
+                try:
+                    ws.row_dimensions[row_num].height = float(row_spec["height"])
+                except (TypeError, ValueError):
+                    pass
+
+            col_num = 1
+            for cell in cells:
+                if isinstance(cell, dict):
+                    value = cell.get("value", "")
+                    span_raw = cell.get("span", 1)
+                    try:
+                        span = max(1, int(span_raw or 1))
+                    except (TypeError, ValueError):
+                        span = 1
+                    style_id = cell.get("style")
+                else:
+                    value = cell
+                    span = 1
+                    style_id = None
+
+                if col_num > max_cols:
+                    max_cols = col_num
+                    text_widths.extend([12.0] * (max_cols - len(text_widths)))
+
+                top_left = ws.cell(row=row_num, column=col_num, value=value)
+                apply_style(top_left, style_id)
+
+                if span > 1:
+                    end_col = col_num + span - 1
+                    ws.merge_cells(start_row=row_num, start_column=col_num, end_row=row_num, end_column=end_col)
+                    max_cols = max(max_cols, end_col)
+                    if len(text_widths) < max_cols:
+                        text_widths.extend([12.0] * (max_cols - len(text_widths)))
+                value_text = str(value or "").replace("\n", " ")
+                estimated = min(42.0, max(12.0, (len(value_text) * 0.85) + 2.0))
+                if span == 1:
+                    idx = col_num - 1
+                    text_widths[idx] = max(text_widths[idx], estimated)
+                else:
+                    span_width = estimated / span
+                    for offset in range(span):
+                        idx = col_num - 1 + offset
+                        if idx >= len(text_widths):
+                            text_widths.extend([12.0] * (idx - len(text_widths) + 1))
+                        text_widths[idx] = max(text_widths[idx], min(28.0, span_width))
+                col_num += span
+
+        for col_idx in range(1, max_cols + 1):
+            width = text_widths[col_idx - 1] if col_idx - 1 < len(text_widths) else 12.0
+            ws.column_dimensions[get_column_letter(col_idx)].width = min(max(width, 10.0), 42.0)
+
+        freeze_panes = sheet.get("freeze_panes") or "A5"
+        ws.freeze_panes = freeze_panes
+
+    return _write_workbook_to_bytes(wb)
+
+
+def _write_workbook_to_bytes(workbook: Any) -> bytes:
+    buffer = BytesIO()
+    workbook.save(buffer)
+    return buffer.getvalue()
+
+
+def normalize_speech_analysis_export_view(speech: Any) -> dict[str, Any]:
+    question_type_aliases = {
+        "rhetorical": "rhetorical",
+        "риторический": "rhetorical",
+        "checking_understanding": "checking_understanding",
+        "проверка понимания": "checking_understanding",
+        "quiz": "quiz",
+        "викторина": "quiz",
+        "clarifying": "clarifying",
+        "уточняющий": "clarifying",
+        "open_ended": "open_ended",
+        "open-ended": "open_ended",
+        "открытый": "open_ended",
+        "factual": "factual",
+        "фактический": "factual",
+        "other": "other",
+        "другой": "other",
+    }
+
+    def normalize_question_type(value: Any) -> str:
+        normalized = str(value or "").strip().casefold()
+        return question_type_aliases.get(normalized, "other" if normalized else "")
+
+    def normalize_fragment(fragment: Any) -> dict[str, Any]:
+        if not isinstance(fragment, dict):
+            text = str(fragment or "").strip()
+            return {"start_ms": 0, "end_ms": 0, "text": text}
+        try:
+            start_value = int(fragment.get("start_ms", 0) or 0)
+        except (TypeError, ValueError):
+            start_value = 0
+        try:
+            end_value = int(fragment.get("end_ms", start_value) or start_value)
+        except (TypeError, ValueError):
+            end_value = start_value
+        if end_value < start_value:
+            end_value = start_value
+        normalized: dict[str, Any] = {
+            "start_ms": start_value,
+            "end_ms": end_value,
+            "text": str(fragment.get("text") or "").strip(),
+        }
+        fragment_type = str(fragment.get("type") or "").strip()
+        if fragment_type:
+            normalized["type"] = fragment_type
+        question_type = normalize_question_type(fragment.get("question_type"))
+        if question_type:
+            normalized["question_type"] = question_type
+        return normalized
+
+    def merge_fragments(primary: list[dict[str, Any]], secondary: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        merged: list[dict[str, Any]] = []
+        seen: set[tuple[int, int, str, str, str]] = set()
+        for fragment in primary + secondary:
+            if not isinstance(fragment, dict):
+                continue
+            key = (
+                int(fragment.get("start_ms", 0) or 0),
+                int(fragment.get("end_ms", 0) or 0),
+                str(fragment.get("text") or "").strip(),
+                str(fragment.get("type") or "").strip(),
+                normalize_question_type(fragment.get("question_type")),
+            )
+            if not key[2] or key in seen:
+                continue
+            seen.add(key)
+            normalized = dict(fragment)
+            qtype = normalize_question_type(normalized.get("question_type"))
+            if qtype:
+                normalized["question_type"] = qtype
+            elif "question_type" in normalized:
+                normalized.pop("question_type", None)
+            merged.append(normalized)
+        return merged
+
+    def collect_chunk_fragments(chunk_analyses: list[dict[str, Any]], key: str) -> list[dict[str, Any]]:
+        fragments: list[dict[str, Any]] = []
+        for chunk in chunk_analyses:
+            if not isinstance(chunk, dict):
+                continue
+            items = chunk.get(key)
+            if not isinstance(items, list):
+                continue
+            fragments.extend(normalize_fragment(item) for item in items if isinstance(item, dict) and str(item.get("text") or "").strip())
+        return fragments
+
+    def collect_chunk_events(chunk_analyses: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        items: list[dict[str, Any]] = []
+        for chunk in chunk_analyses:
+            if not isinstance(chunk, dict):
+                continue
+            events = chunk.get("lesson_events")
+            if not isinstance(events, list):
+                continue
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                try:
+                    start_value = int(event.get("start_ms", 0) or 0)
+                except (TypeError, ValueError):
+                    start_value = 0
+                items.append(
+                    {
+                        "time_ms": start_value,
+                        "time": format_timestamp(start_value / 1000),
+                        "title": str(event.get("title") or "").strip() or "Событие урока",
+                        "description": str(event.get("description") or "").strip(),
+                    }
+                )
+        items.sort(key=lambda item: int(item.get("time_ms", 0) or 0))
+        return items
+
+    speech_data = speech if isinstance(speech, dict) else {}
+    chunk_analyses = speech_data.get("chunk_analyses") if isinstance(speech_data.get("chunk_analyses"), list) else []
+
+    lesson_format_raw = speech_data.get("lesson_format") if isinstance(speech_data.get("lesson_format"), dict) else {}
+    audience_engagement_raw = speech_data.get("audience_engagement") if isinstance(speech_data.get("audience_engagement"), dict) else {}
+    lesson_structure_raw = speech_data.get("lesson_structure") if isinstance(speech_data.get("lesson_structure"), dict) else {}
+    material_explanation_raw = speech_data.get("material_explanation") if isinstance(speech_data.get("material_explanation"), dict) else {}
+    teacher_recommendation_raw = speech_data.get("teacher_recommendation") if isinstance(speech_data.get("teacher_recommendation"), dict) else {}
+    flags_raw = speech_data.get("flags") if isinstance(speech_data.get("flags"), dict) else {}
+
+    questions_raw = audience_engagement_raw.get("questions_to_students") if isinstance(audience_engagement_raw.get("questions_to_students"), dict) else {}
+    answers_raw = audience_engagement_raw.get("student_answers") if isinstance(audience_engagement_raw.get("student_answers"), dict) else {}
+    timeline_raw = lesson_structure_raw.get("step_by_step_explanation") if isinstance(lesson_structure_raw.get("step_by_step_explanation"), dict) else {}
+    goals_raw = lesson_structure_raw.get("goals_and_summary") if isinstance(lesson_structure_raw.get("goals_and_summary"), dict) else {}
+    examples_raw = material_explanation_raw.get("examples_and_analogies") if isinstance(material_explanation_raw.get("examples_and_analogies"), dict) else {}
+
+    derived_questions = collect_chunk_fragments(chunk_analyses, "teacher_questions")
+    derived_answers = collect_chunk_fragments(chunk_analyses, "student_answers")
+    derived_examples = collect_chunk_fragments(chunk_analyses, "examples_and_analogies")
+    derived_timeline = collect_chunk_events(chunk_analyses)
+    derived_profanity: list[dict[str, Any]] = []
+    derived_familiarity: list[dict[str, Any]] = []
+    for chunk in chunk_analyses:
+        if not isinstance(chunk, dict):
+            continue
+        chunk_flags = chunk.get("flags") if isinstance(chunk.get("flags"), dict) else {}
+        profanity_items = chunk_flags.get("profanity") if isinstance(chunk_flags.get("profanity"), list) else []
+        familiarity_items = chunk_flags.get("overly_familiar_tone") if isinstance(chunk_flags.get("overly_familiar_tone"), list) else []
+        derived_profanity.extend(normalize_fragment(item) for item in profanity_items if isinstance(item, dict) and str(item.get("text") or "").strip())
+        derived_familiarity.extend(normalize_fragment(item) for item in familiarity_items if isinstance(item, dict) and str(item.get("text") or "").strip())
+
+    derived_intro: dict[str, Any] | None = None
+    derived_summary: dict[str, Any] | None = None
+    for chunk in chunk_analyses:
+        if not isinstance(chunk, dict):
+            continue
+        chunk_goals = chunk.get("goals_and_summary") if isinstance(chunk.get("goals_and_summary"), dict) else {}
+        intro = chunk_goals.get("intro") if isinstance(chunk_goals.get("intro"), dict) else {}
+        summary = chunk_goals.get("summary") if isinstance(chunk_goals.get("summary"), dict) else {}
+        if derived_intro is None and intro:
+            derived_intro = {
+                "present": bool(intro.get("present")),
+                "start_ms": intro.get("start_ms"),
+                "comment": str(intro.get("comment") or "").strip(),
+            }
+        elif derived_intro is not None and not derived_intro.get("present") and bool(intro.get("present")):
+            derived_intro = {
+                "present": True,
+                "start_ms": intro.get("start_ms"),
+                "comment": str(intro.get("comment") or "").strip(),
+            }
+        if derived_summary is None and summary:
+            derived_summary = {
+                "present": bool(summary.get("present")),
+                "start_ms": summary.get("start_ms"),
+                "comment": str(summary.get("comment") or "").strip(),
+            }
+        elif derived_summary is not None and not derived_summary.get("present") and bool(summary.get("present")):
+            derived_summary = {
+                "present": True,
+                "start_ms": summary.get("start_ms"),
+                "comment": str(summary.get("comment") or "").strip(),
+            }
+
+    lesson_format = {
+        "format": str(lesson_format_raw.get("format") or "").strip() or (
+            "Агрегированный анализ речи преподавателя"
+            if chunk_analyses
+            else "Формат занятия не определен"
+        ),
+        "comment": str(lesson_format_raw.get("comment") or "").strip() or (
+            f"Проанализировано чанков: {len(chunk_analyses)}"
+            if chunk_analyses
+            else "Агрегированный анализ речи преподавателя готов."
+        ),
+    }
+
+    questions = {
+        "title": normalize_speech_title(questions_raw.get("title") or "Вопросы преподавателя"),
+        "comment": str(questions_raw.get("comment") or "").strip(),
+        "fragments": merge_fragments(
+            [normalize_fragment(fragment) for fragment in (questions_raw.get("fragments") if isinstance(questions_raw.get("fragments"), list) else [])],
+            derived_questions,
+        ),
+    }
+    answers = {
+        "title": normalize_speech_title(answers_raw.get("title") or "Ответы студентов"),
+        "comment": str(answers_raw.get("comment") or "").strip(),
+        "fragments": merge_fragments(
+            [normalize_fragment(fragment) for fragment in (answers_raw.get("fragments") if isinstance(answers_raw.get("fragments"), list) else [])],
+            derived_answers,
+        ),
+    }
+
+    timeline = {
+        "title": str(timeline_raw.get("title") or "Таймлайн урока").strip(),
+        "timeline": [],
+    }
+    if isinstance(timeline_raw.get("timeline"), list) and timeline_raw.get("timeline"):
+        for item in timeline_raw.get("timeline"):
+            if not isinstance(item, dict):
+                continue
+            try:
+                start_value = int(item.get("start_ms", 0) or 0)
+            except (TypeError, ValueError):
+                start_value = 0
+            timeline["timeline"].append(
+                {
+                    "start_ms": start_value,
+                    "time": format_timestamp(start_value / 1000),
+                    "title": str(item.get("title") or "Событие урока").strip(),
+                    "comment": str(item.get("description") or "").strip(),
+                }
+            )
+    else:
+        timeline["timeline"] = [
+            {"start_ms": item["time_ms"], "time": item["time"], "title": item["title"], "comment": item["description"]}
+            for item in derived_timeline
+        ]
+
+    intro_raw = goals_raw.get("intro") if isinstance(goals_raw.get("intro"), dict) else {}
+    summary_raw = goals_raw.get("summary") if isinstance(goals_raw.get("summary"), dict) else {}
+    goals = {
+        "title": str(goals_raw.get("title") or "Цели и итоги урока").strip(),
+        "intro": {
+            "present": bool(intro_raw.get("present")) if intro_raw else bool(derived_intro.get("present")) if isinstance(derived_intro, dict) else False,
+            "start_ms": intro_raw.get("start_ms") if intro_raw else (derived_intro.get("start_ms") if isinstance(derived_intro, dict) else None),
+            "comment": str(intro_raw.get("comment") or "").strip() if intro_raw else (str(derived_intro.get("comment") or "").strip() if isinstance(derived_intro, dict) else ""),
+        },
+        "summary": {
+            "present": bool(summary_raw.get("present")) if summary_raw else bool(derived_summary.get("present")) if isinstance(derived_summary, dict) else False,
+            "start_ms": summary_raw.get("start_ms") if summary_raw else (derived_summary.get("start_ms") if isinstance(derived_summary, dict) else None),
+            "comment": str(summary_raw.get("comment") or "").strip() if summary_raw else (str(derived_summary.get("comment") or "").strip() if isinstance(derived_summary, dict) else ""),
+        },
+    }
+
+    examples = {
+        "title": str(examples_raw.get("title") or "Примеры, аналогии и сторителлинг").strip(),
+        "fragments": merge_fragments(
+            [normalize_fragment(fragment) for fragment in (examples_raw.get("fragments") if isinstance(examples_raw.get("fragments"), list) else [])],
+            derived_examples,
+        ),
+    }
+
+    recommendation = {
+        "title": str(teacher_recommendation_raw.get("title") or "Рекомендация преподавателю").strip(),
+        "comment": str(teacher_recommendation_raw.get("comment") or "").strip(),
+    }
+
+    flags: dict[str, Any] = {}
+    for key, fallback_title, derived_fragments in [
+        ("profanity", "Ненормативная лексика", derived_profanity),
+        ("overly_familiar_tone", "Панибратство", derived_familiarity),
+    ]:
+        block = flags_raw.get(key) if isinstance(flags_raw.get(key), dict) else {}
+        fragments = block.get("fragments") if isinstance(block.get("fragments"), list) else []
+        flags[key] = {
+            "title": str(block.get("title") or fallback_title).strip(),
+            "present": bool(block.get("present")) or bool(derived_fragments) or bool(fragments),
+            "fragments": merge_fragments(
+                [normalize_fragment(fragment) for fragment in fragments],
+                derived_fragments,
+            ),
+        }
+
+    return {
+        "lesson_format": lesson_format,
+        "audience_engagement": {
+            "questions_to_students": questions,
+            "student_answers": answers,
+        },
+        "lesson_structure": {
+            "step_by_step_explanation": timeline,
+            "goals_and_summary": goals,
+        },
+        "material_explanation": {
+            "examples_and_analogies": examples,
+        },
+        "teacher_recommendation": recommendation,
+        "flags": flags,
+        "chunk_analyses": chunk_analyses,
+    }
+
+
+def build_speech_analysis_export_worksheets(generation: dict[str, Any]) -> list[dict[str, Any]]:
+    transcript = generation.get("transcript") if isinstance(generation.get("transcript"), list) else []
+    speech = speech_analysis_from_generation(generation)
+    if not speech:
+        return []
+    speech = normalize_speech_analysis_export_view(speech)
+
+    question_type_labels = {
+        "rhetorical": "риторический",
+        "checking_understanding": "проверка понимания",
+        "quiz": "викторина",
+        "clarifying": "уточняющий",
+        "open_ended": "открытый",
+        "factual": "фактический",
+        "other": "другой",
+    }
+
+    def transcript_fragment_row(section: str, title: str, fragment: Any) -> list[str]:
+        fragment_text = str(fragment.get("text") or "").strip() if isinstance(fragment, dict) else str(fragment or "").strip()
+        if isinstance(fragment, dict):
+            fragment_type = str(fragment.get("type") or "").strip().casefold()
+            if fragment_type in {"example", "analogy", "metaphor", "storytelling"}:
+                type_labels = {"example": "пример", "analogy": "аналогия", "metaphor": "метафора", "storytelling": "сторителлинг"}
+                fragment_text = f"{fragment_text} ({type_labels[fragment_type]})"
+            qtype = str(fragment.get("question_type") or "").strip().casefold()
+            if qtype in question_type_labels:
+                fragment_text = f"{fragment_text} [{question_type_labels[qtype]}]"
+        start_ms_value: Any = fragment.get("start_ms") if isinstance(fragment, dict) else None
+        end_ms_value: Any = fragment.get("end_ms") if isinstance(fragment, dict) else None
+        lines = transcript_lines_by_ms_range(transcript, start_ms_value, end_ms_value)
+        found = "Да" if lines else "Нет"
+        try:
+            start_value = int(start_ms_value or 0) if start_ms_value is not None else 0
+        except (TypeError, ValueError):
+            start_value = 0
+        try:
+            end_value = int(end_ms_value if end_ms_value is not None else start_value)
+        except (TypeError, ValueError):
+            end_value = start_value
+        if end_value < start_value:
+            start_value, end_value = end_value, start_value
+        timestamp = f"{format_timestamp(start_value / 1000)}–{format_timestamp(end_value / 1000)}" if end_value > start_value else format_timestamp(start_value / 1000)
+        transcript_text = " / ".join(str(line.get("text") or "").strip() for line in lines if str(line.get("text") or "").strip())
+        return [section, title, fragment_text, found, timestamp, transcript_text]
+
+    lesson_format = speech.get("lesson_format") if isinstance(speech.get("lesson_format"), dict) else {}
+    audience_engagement = speech.get("audience_engagement") if isinstance(speech.get("audience_engagement"), dict) else {}
+    lesson_structure = speech.get("lesson_structure") if isinstance(speech.get("lesson_structure"), dict) else {}
+    material_explanation = speech.get("material_explanation") if isinstance(speech.get("material_explanation"), dict) else {}
+    flags = speech.get("flags") if isinstance(speech.get("flags"), dict) else {}
+    chunk_analyses = speech.get("chunk_analyses") if isinstance(speech.get("chunk_analyses"), list) else []
+
+    questions = audience_engagement.get("questions_to_students") if isinstance(audience_engagement.get("questions_to_students"), dict) else {}
+    student_answers = audience_engagement.get("student_answers") if isinstance(audience_engagement.get("student_answers"), dict) else {}
+    timeline = lesson_structure.get("step_by_step_explanation") if isinstance(lesson_structure.get("step_by_step_explanation"), dict) else {}
+    goals = lesson_structure.get("goals_and_summary") if isinstance(lesson_structure.get("goals_and_summary"), dict) else {}
+    examples = material_explanation.get("examples_and_analogies") if isinstance(material_explanation.get("examples_and_analogies"), dict) else {}
+    teacher_recommendation = speech.get("teacher_recommendation") if isinstance(speech.get("teacher_recommendation"), dict) else {}
+
+    questions_fragments = questions.get("fragments") if isinstance(questions.get("fragments"), list) else []
+    answers_fragments = student_answers.get("fragments") if isinstance(student_answers.get("fragments"), list) else []
+    examples_fragments = examples.get("fragments") if isinstance(examples.get("fragments"), list) else []
+    timeline_items = timeline.get("timeline") if isinstance(timeline.get("timeline"), list) else []
+    profanity_block = flags.get("profanity") if isinstance(flags.get("profanity"), dict) else {}
+    familiarity_block = flags.get("overly_familiar_tone") if isinstance(flags.get("overly_familiar_tone"), dict) else {}
+    profanity_fragments = profanity_block.get("fragments") if isinstance(profanity_block.get("fragments"), list) else []
+    familiarity_fragments = familiarity_block.get("fragments") if isinstance(familiarity_block.get("fragments"), list) else []
+
+    def fmt_score(_value: float) -> str:
+        return "-"
+
+    def score_style(value: float) -> int:
+        if value >= 1.5:
+            return 13
+        if value >= 0.5:
+            return 12
+        return 11
+
+    def factual_label(score: float) -> str:
+        if score >= 1.5:
+            return "было"
+        if score >= 0.5:
+            return "частично"
+        return "не было"
+
+    def count_types(fragments: list[dict[str, Any]], types: set[str]) -> int:
+        total = 0
+        for fragment in fragments:
+            if not isinstance(fragment, dict):
+                continue
+            if str(fragment.get("question_type") or "").strip().casefold() in types:
+                total += 1
+        return total
+
+    def section_rows(title: str, fill_style: int, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        block: list[dict[str, Any]] = [{"cells": [{"value": title, "style": fill_style, "span": 6}], "height": 22}]
+        block.append({"cells": [{"value": h, "style": 1} for h in ["Компетенция", "Поведенческие индикаторы", "Проявление", "Фактические действия (было/не было)", "Средний балл", "Дополнительные комментарии"]], "height": 20})
+        scores: list[float] = []
+        for item in items:
+            score = float(item.get("score", 0) or 0)
+            scores.append(score)
+            block.append({
+                "cells": [
+                    {"value": item.get("competence", ""), "style": 14, "span": 1},
+                    {"value": item.get("indicator", ""), "style": 5, "span": 1},
+                    {"value": item.get("manifestation", ""), "style": 5, "span": 1},
+                    {"value": factual_label(score), "style": 5, "span": 1},
+                    {"value": fmt_score(score), "style": score_style(score), "span": 1},
+                    {"value": item.get("comment", ""), "style": 5, "span": 1},
+                ],
+                "height": int(item.get("height", 24) or 24),
+            })
+        avg = sum(scores) / len(scores) if scores else 0
+        note = str(items[-1].get("summary_note") or "") if items else ""
+        block.append({
+            "cells": [
+                {"value": "Средний балл секции", "style": 14, "span": 4},
+                {"value": fmt_score(avg), "style": score_style(avg), "span": 1},
+                {"value": note or "Оценка секции по сигналам анализа речи.", "style": 5, "span": 1},
+            ],
+            "height": 24,
+        })
+        block.append({"cells": [], "height": 6})
+        return block
+
+    total_questions = len(questions_fragments)
+    total_answers = len(answers_fragments)
+    total_examples = len(examples_fragments)
+    total_events = len(timeline_items)
+    total_flags = len(profanity_fragments) + len(familiarity_fragments)
+    has_timeline = total_events > 0
+    open_question_count = count_types(questions_fragments, {"open_ended", "clarifying", "factual"})
+    checking_question_count = count_types(questions_fragments, {"checking_understanding", "quiz"})
+    rhetorical_question_count = count_types(questions_fragments, {"rhetorical"})
+    has_intro = bool(goals.get("intro", {}).get("present")) if isinstance(goals.get("intro"), dict) else False
+    has_summary = bool(goals.get("summary", {}).get("present")) if isinstance(goals.get("summary"), dict) else False
+    has_profanity = bool(profanity_block.get("present"))
+    has_familiarity = bool(familiarity_block.get("present"))
+
+    created_at = generation.get("created_at")
+    date_text = ""
+    if created_at:
+        try:
+            date_text = datetime.fromisoformat(str(created_at).replace("Z", "+00:00")).strftime("%d.%m.%Y")
+        except Exception:
+            date_text = str(created_at)
+
+    def first_text(items: list[dict[str, Any]], fallback: str) -> str:
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            text = str(item.get("text") or "").strip()
+            if text:
+                return text
+        return fallback
+
+    rows: list[dict[str, Any]] = [
+        {"cells": [{"value": "Чек-лист качества преподавания на занятии", "style": 2, "span": 6}], "height": 24},
+        {"cells": [{"value": "Сделайте копию шаблона и заполните показатели на основе анализа речи преподавателя. Оставьте пустые ячейки там, где сигналов недостаточно для объективной оценки.", "style": 7, "span": 6}], "height": 36},
+        {"cells": [{"value": "Дата формирования", "style": 14, "span": 1}, {"value": date_text, "style": 5, "span": 2}, {"value": "Файл", "style": 14, "span": 1}, {"value": str(generation.get("file_name") or "Без названия").strip(), "style": 5, "span": 2}], "height": 20},
+        {"cells": [{"value": "Формат занятия", "style": 14, "span": 1}, {"value": str(lesson_format.get("format") or "Формат занятия не определен").strip(), "style": 5, "span": 2}, {"value": "Рекомендация", "style": 14, "span": 1}, {"value": str(teacher_recommendation.get("title") or "Рекомендация преподавателю").strip(), "style": 5, "span": 2}], "height": 20},
+        {"cells": [{"value": "Комментарий", "style": 14, "span": 1}, {"value": str(lesson_format.get("comment") or "Агрегированный анализ речи преподавателя готов.").strip(), "style": 5, "span": 5}], "height": 28},
+        {"cells": [], "height": 6},
+        {"cells": [{"value": "Легенда", "style": 4, "span": 6}], "height": 20},
+        {"cells": [{"value": "Баллы", "style": 1}, {"value": "Смысл", "style": 1}, {"value": "Комментарий", "style": 1}, {"value": "", "style": 1}, {"value": "", "style": 1}, {"value": "", "style": 1}], "height": 20},
+        {"cells": [{"value": "0", "style": 11, "span": 1}, {"value": "Отсутствие или несоответствие требованиям", "style": 5, "span": 2}, {"value": "Если показатель нельзя подтвердить по анализу или наблюдается нарушение.", "style": 7, "span": 3}], "height": 22},
+        {"cells": [{"value": "1", "style": 12, "span": 1}, {"value": "Частичное соответствие", "style": 5, "span": 2}, {"value": "Сигнал есть, но он неполный, редкий или выражен неустойчиво.", "style": 7, "span": 3}], "height": 22},
+        {"cells": [{"value": "2", "style": 13, "span": 1}, {"value": "Полное соответствие", "style": 5, "span": 2}, {"value": "Показатель проявляется уверенно и повторяется в анализе речи.", "style": 7, "span": 3}], "height": 22},
+        {"cells": [], "height": 8},
+        {"cells": [{"value": "Анализ по индикаторам", "style": 4, "span": 6}], "height": 20},
+    ]
+
+    rows.extend(section_rows("Организация понятного процесса обучения", 8, [
+        {
+            "competence": "Организация обучения",
+            "indicator": "Приветствие и вход в урок",
+            "manifestation": first_text(timeline_items, "В начале урока фиксируется вход в тему"),
+            "score": 2 if has_intro or has_timeline else 1,
+            "comment": "В начале есть структурирующий сигнал о входе в занятие." if has_intro or has_timeline else "Явного сигнала входа в урок не видно.",
+        },
+        {
+            "competence": "Постановка задач",
+            "indicator": "Формулирует цели и задачи занятия",
+            "manifestation": str(goals.get("intro", {}).get("comment") or "Цели занятия проговариваются").strip() if isinstance(goals.get("intro"), dict) else "Цели занятия проговариваются",
+            "score": 2 if has_intro else 0,
+            "comment": "В начале урока есть явный сигнал о целях и рамке." if has_intro else "Явного сигнала о целях занятия не видно.",
+        },
+        {
+            "competence": "Тайм-менеджмент",
+            "indicator": "Укладывается в запланированную структуру",
+            "manifestation": f"Этапов урока: {total_events}",
+            "score": 2 if total_events >= 2 else 1 if total_events else 0,
+            "comment": "В таймлайне просматриваются этапы занятия." if total_events else "Структура по времени выражена слабо.",
+        },
+        {
+            "competence": "Педагогическая гибкость",
+            "indicator": "Меняет подачу по ситуации",
+            "manifestation": f"Примеры и аналогии: {total_examples}",
+            "score": 2 if total_examples else 1 if total_questions else 0,
+            "comment": "Примеры и аналогии помогают адаптировать объяснение." if total_examples else "Данных о гибкой перестройке подачи немного.",
+        },
+    ]))
+
+    rows.extend(section_rows("Этика преподавания", 8, [
+        {
+            "competence": "Уважение к студентам и коллегам",
+            "indicator": "Справедливо и объективно относится к участникам",
+            "manifestation": "Ненормативная лексика и панибратство не подтверждены" if not has_profanity and not has_familiarity else "Есть сигналы, требующие внимания",
+            "score": 2 if not has_profanity and not has_familiarity else 0,
+            "comment": "Тон выглядит профессиональным и дистанция выдержана." if not has_profanity and not has_familiarity else "Есть речевые сигналы для доработки.",
+        },
+        {
+            "competence": "Создание благоприятной атмосферы",
+            "indicator": "Студенты не боятся задавать вопросы и комментировать",
+            "manifestation": f"Вопросов преподавателя: {total_questions}, ответов студентов: {total_answers}",
+            "score": 2 if total_questions and total_answers and not has_profanity else 1 if total_questions else 0,
+            "comment": "Есть диалог и ответы студентов, атмосфера поддерживается вопросами." if total_questions else "Для уверенного вывода не хватает признаков диалога.",
+        },
+    ]))
+
+    rows.extend(section_rows("Качество материала и владение им", 8, [
+        {
+            "competence": "Подготовка к занятию",
+            "indicator": "Понимает образовательные результаты и структуру материала",
+            "manifestation": str(lesson_format.get("format") or "Структурированный анализ речи").strip(),
+            "score": 2 if lesson_format else 1,
+            "comment": str(lesson_format.get("comment") or "Анализ построен по структуре урока.").strip(),
+        },
+        {
+            "competence": "Доходчивость",
+            "indicator": "Объясняет сложные моменты доступным способом",
+            "manifestation": f"Примеры/аналогии: {total_examples}; ответы студентов: {total_answers}",
+            "score": 2 if total_examples else 1 if total_answers else 0,
+            "comment": "Объяснение поддерживается примерами и короткими пояснениями." if total_examples else "Пока мало прямых сигналов о доступности объяснения.",
+        },
+        {
+            "competence": "Актуальность и широта",
+            "indicator": "Выходит за рамки сухого пересказа",
+            "manifestation": first_text(examples_fragments, "Примеры и аналогии как контекстуализация материала"),
+            "score": 2 if total_examples >= 2 else 1 if total_examples else 0,
+            "comment": "Материал подаётся через живые примеры и контекст." if total_examples else "Сигналов о широте контекста немного.",
+        },
+        {
+            "competence": "Реакция на вопросы",
+            "indicator": "Отвечает и развивает ответы аудитории",
+            "manifestation": f"Вопросы: {total_questions}, ответы: {total_answers}",
+            "score": 2 if total_answers else 1 if total_questions else 0,
+            "comment": "В анализе есть взаимодействие на вопрос-ответ." if total_answers else "Недостаточно ответных реплик студентов.",
+        },
+    ]))
+
+    rows.extend(section_rows("Управление динамикой занятия", 8, [
+        {
+            "competence": "Организация взаимодействия",
+            "indicator": "Вовлекает студентов в процесс обучения",
+            "manifestation": f"Всего вопросов: {total_questions}",
+            "score": 2 if total_questions else 0,
+            "comment": f"Есть {total_questions} вопросов к аудитории." if total_questions else "Вопросов к аудитории не найдено.",
+        },
+        {
+            "competence": "Умение слушать",
+            "indicator": "Серьёзно подходит к ответам студентов",
+            "manifestation": f"Ответов студентов: {total_answers}",
+            "score": 2 if total_answers else 0,
+            "comment": "Есть ответы студентов, на которые можно опереться." if total_answers else "В данных нет ответов студентов.",
+        },
+        {
+            "competence": "Мониторинг понимания",
+            "indicator": "Регулярно проверяет понимание материала",
+            "manifestation": f"Вопросов на проверку понимания: {checking_question_count}",
+            "score": 2 if checking_question_count else 1 if total_questions else 0,
+            "comment": "Вопросы на понимание присутствуют." if checking_question_count else "Проверка понимания выражена слабо.",
+        },
+        {
+            "competence": "Обратная связь",
+            "indicator": "Даёт конструктивную обратную связь",
+            "manifestation": "Ответы и уточнения фиксируются в анализе" if total_answers else "Сигналов обратной связи мало",
+            "score": 2 if total_answers else 0,
+            "comment": "Взаимодействие с ответами студентов есть." if total_answers else "Недостаточно данных для оценки обратной связи.",
+        },
+    ]))
+
+    rows.extend(section_rows("Структура речи и языка", 8, [
+        {
+            "competence": "Структурирование презентации",
+            "indicator": "Чётко и логично выстраивает материал",
+            "manifestation": f"Этапов урока: {total_events}",
+            "score": 2 if total_events else 1,
+            "comment": "Таймлайн показывает последовательность изложения." if total_events else "Структура изложения просматривается слабо.",
+        },
+        {
+            "competence": "Грамотность речи",
+            "indicator": "Избегает слов-паразитов и грубых выражений",
+            "manifestation": "Ненормативная лексика не подтверждена" if not has_profanity else "Есть сигналы на проверку",
+            "score": 2 if not has_profanity else 0,
+            "comment": "Речь выглядит аккуратной и профессиональной." if not has_profanity else "Есть сигналы на доработку речевой культуры.",
+        },
+        {
+            "competence": "Темп речи",
+            "indicator": "Держит темп, при котором студенты успевают воспринимать информацию",
+            "manifestation": f"Событий урока: {total_events}; вопросных сигналов: {total_questions}",
+            "score": 2 if total_events >= 2 else 1,
+            "comment": "Есть распределение по этапам и паузы для проверки понимания." if total_events >= 2 else "Темп трудно оценить по имеющимся сигналам.",
+        },
+        {
+            "competence": "Понятные языковые конструкции",
+            "indicator": "Мысли выражаются ёмко и ясно",
+            "manifestation": str(lesson_format.get("comment") or "Наблюдается структурированная подача").strip(),
+            "score": 2 if total_examples or total_questions else 1,
+            "comment": "Формулировки выглядят собранными и понятными." if total_examples or total_questions else "Сигналов о языковой ясности немного.",
+        },
+    ]))
+
+    rows.extend(section_rows("Приёмы вовлечения аудитории", 8, [
+        {
+            "competence": "Управление вниманием аудитории",
+            "indicator": "Задаёт вопросы, чтобы вовлечь студентов",
+            "manifestation": f"Всего вопросов: {total_questions}",
+            "score": 2 if total_questions else 0,
+            "comment": "Вовлечение строится через вопросы к аудитории." if total_questions else "Вопросные механики не просматриваются.",
+        },
+        {
+            "competence": "Открытые вопросы",
+            "indicator": "Использует открытые/уточняющие вопросы",
+            "manifestation": f"Открытых и уточняющих вопросов: {open_question_count}",
+            "score": 2 if open_question_count else 1 if total_questions else 0,
+            "comment": "Вопросы на разворачивание мысли присутствуют." if open_question_count else "Открытые вопросы не доминируют.",
+        },
+        {
+            "competence": "Примеры и аналогии",
+            "indicator": "Использует сторителлинг, примеры и аналогии",
+            "manifestation": f"Примеров/аналогий: {total_examples}",
+            "score": 2 if total_examples else 0,
+            "comment": "Примеры и аналогии помогают удерживать внимание." if total_examples else "Примеры и аналогии не отмечены.",
+        },
+        {
+            "competence": "Разнообразие механик",
+            "indicator": "Использует несколько способов вовлечения",
+            "manifestation": f"Вопросы: {total_questions}, примеры: {total_examples}, риторические вопросы: {rhetorical_question_count}",
+            "score": 2 if total_questions and total_examples else 1 if total_questions or total_examples else 0,
+            "comment": "В анализе виден микс вопросов и примеров." if total_questions and total_examples else "Набор приёмов пока ограничен.",
+        },
+    ]))
+
+    rows.extend(section_rows("Итог и рекомендация", 8, [
+        {
+            "competence": "Рекомендация преподавателю",
+            "indicator": "Итоговый комментарий модели",
+            "manifestation": str(teacher_recommendation.get("title") or "Рекомендация преподавателю").strip(),
+            "score": 2 if str(teacher_recommendation.get("comment") or "").strip() else 1,
+            "comment": str(teacher_recommendation.get("comment") or "Комментарий отсутствует.").strip(),
+            "summary_note": "Это финальный вывод по всем сигналам анализа речи.",
+        },
+    ]))
+
+    numeric_scores: list[float] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        cells = row.get("cells") if isinstance(row.get("cells"), list) else []
+        for cell in cells:
+            if isinstance(cell, dict) and int(cell.get("style", 0) or 0) in {11, 12, 13}:
+                try:
+                    numeric_scores.append(float(str(cell.get("value") or 0).replace(",", ".")))
+                except Exception:
+                    pass
+
+    overall_score = sum(numeric_scores) / len(numeric_scores) if numeric_scores else 0
+    rows.append({"cells": [{"value": "Итоговый средний балл", "style": 14, "span": 4}, {"value": "-", "style": score_style(overall_score), "span": 1}, {"value": "Сводная оценка по всем индикаторам анализа речи.", "style": 5, "span": 1}], "height": 28})
+    rows.append({"cells": [], "height": 6})
+
+    return [
+        {
+            "name": "Анализ речи",
+            "rows": rows,
+            "cols": [20, 28, 30, 16, 12, 40],
+            "page_setup": {"orientation": "landscape", "paperSize": 9, "fitToWidth": 1, "fitToHeight": 1},
+            "freeze_panes": "A12",
+        }
+    ]
+
+
+def build_speech_analysis_export_worksheets_from_payload(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    transcript = payload.get("transcript") if isinstance(payload.get("transcript"), list) else []
+    speech = payload.get("speech_analysis") if isinstance(payload.get("speech_analysis"), dict) else {}
+    if not speech:
+        return []
+    generation = {
+        "transcript": transcript,
+        "analytics": {"speech_analysis": speech},
+    }
+    return build_speech_analysis_export_worksheets_precise(generation)
+
+
+def build_speech_analysis_export_worksheets_precise(generation: dict[str, Any]) -> list[dict[str, Any]]:
+    transcript = generation.get("transcript") if isinstance(generation.get("transcript"), list) else []
+    speech = speech_analysis_from_generation(generation)
+    if not speech:
+        return []
+    speech = normalize_speech_analysis_export_view(speech)
+
+    lesson_format = speech.get("lesson_format") if isinstance(speech.get("lesson_format"), dict) else {}
+    audience_engagement = speech.get("audience_engagement") if isinstance(speech.get("audience_engagement"), dict) else {}
+    lesson_structure = speech.get("lesson_structure") if isinstance(speech.get("lesson_structure"), dict) else {}
+    material_explanation = speech.get("material_explanation") if isinstance(speech.get("material_explanation"), dict) else {}
+    flags = speech.get("flags") if isinstance(speech.get("flags"), dict) else {}
+    teacher_recommendation = speech.get("teacher_recommendation") if isinstance(speech.get("teacher_recommendation"), dict) else {}
+
+    questions = audience_engagement.get("questions_to_students") if isinstance(audience_engagement.get("questions_to_students"), dict) else {}
+    student_answers = audience_engagement.get("student_answers") if isinstance(audience_engagement.get("student_answers"), dict) else {}
+    timeline = lesson_structure.get("step_by_step_explanation") if isinstance(lesson_structure.get("step_by_step_explanation"), dict) else {}
+    goals = lesson_structure.get("goals_and_summary") if isinstance(lesson_structure.get("goals_and_summary"), dict) else {}
+    examples = material_explanation.get("examples_and_analogies") if isinstance(material_explanation.get("examples_and_analogies"), dict) else {}
+
+    questions_fragments = questions.get("fragments") if isinstance(questions.get("fragments"), list) else []
+    answers_fragments = student_answers.get("fragments") if isinstance(student_answers.get("fragments"), list) else []
+    examples_fragments = examples.get("fragments") if isinstance(examples.get("fragments"), list) else []
+    timeline_items = timeline.get("timeline") if isinstance(timeline.get("timeline"), list) else []
+    profanity_block = flags.get("profanity") if isinstance(flags.get("profanity"), dict) else {}
+    familiarity_block = flags.get("overly_familiar_tone") if isinstance(flags.get("overly_familiar_tone"), dict) else {}
+    profanity_fragments = profanity_block.get("fragments") if isinstance(profanity_block.get("fragments"), list) else []
+    familiarity_fragments = familiarity_block.get("fragments") if isinstance(familiarity_block.get("fragments"), list) else []
+
+    question_type_labels = {
+        "rhetorical": "риторический",
+        "checking_understanding": "проверка понимания",
+        "quiz": "викторина",
+        "clarifying": "уточняющий",
+        "open_ended": "открытый",
+        "factual": "фактический",
+        "other": "другой",
+    }
+    question_type_order = ["checking_understanding", "open_ended", "clarifying", "quiz", "factual", "rhetorical", "other"]
+
+    def clean(value: Any) -> str:
+        return str(value or "").strip()
+
+    def percentage(part: int, total: int) -> str:
+        if total <= 0:
+            return "0%"
+        return f"{round((part / total) * 100)}%"
+
+    def timestamp_range(fragment: Any) -> str:
+        if not isinstance(fragment, dict):
+            return ""
+        try:
+            start_value = int(fragment.get("start_ms", 0) or 0)
+        except (TypeError, ValueError):
+            start_value = 0
+        try:
+            end_value = int(fragment.get("end_ms", start_value) or start_value)
+        except (TypeError, ValueError):
+            end_value = start_value
+        if end_value < start_value:
+            start_value, end_value = end_value, start_value
+        return f"{format_timestamp(start_value / 1000)}–{format_timestamp(end_value / 1000)}" if end_value > start_value else format_timestamp(start_value / 1000)
+
+    def transcript_text(fragment: Any) -> str:
+        if not isinstance(fragment, dict):
+            return ""
+        lines = transcript_lines_by_ms_range(transcript, fragment.get("start_ms"), fragment.get("end_ms"))
+        return " / ".join(clean(line.get("text")) for line in lines if clean(line.get("text")))
+
+    def fragment_manifestation(fragment: Any) -> str:
+        if not isinstance(fragment, dict):
+            return clean(fragment)
+        text = clean(fragment.get("text"))
+        ftype = clean(fragment.get("type")).casefold()
+        if ftype in {"example", "analogy", "metaphor", "storytelling"}:
+            return f"{text} ({ {'example': 'пример', 'analogy': 'аналогия', 'metaphor': 'метафора', 'storytelling': 'сторителлинг'}[ftype] })" if text else ""
+        qtype = clean(fragment.get("question_type")).casefold()
+        if qtype in question_type_labels and text:
+            return f"{text} [{question_type_labels[qtype]}]"
+        return text
+
+    def example_type_label(fragment: Any) -> str:
+        if not isinstance(fragment, dict):
+            return "Пример"
+        ftype = clean(fragment.get("type")).casefold()
+        labels = {
+            "example": "Пример",
+            "analogy": "Аналогия",
+            "metaphor": "Метафора",
+            "storytelling": "Сторителлинг",
+        }
+        return labels.get(ftype, "Пример")
+
+    def fragment_comment(fragment: Any) -> str:
+        if not isinstance(fragment, dict):
+            return ""
+        parts = [piece for piece in [timestamp_range(fragment), transcript_text(fragment)] if piece]
+        return " | ".join(parts)
+
+    def join_comments(fragments: list[dict[str, Any]], limit: int = 3) -> str:
+        parts: list[str] = []
+        seen: set[str] = set()
+        for fragment in fragments[:limit]:
+            comment = fragment_comment(fragment)
+            if comment and comment not in seen:
+                seen.add(comment)
+                parts.append(comment)
+        return "\n".join(parts)
+
+    def point(_value: int) -> str:
+        return "-"
+
+    def question_points(count: int) -> int:
+        return 2 if count > 0 else 0
+
+    def atmosphere_points(answers_count: int, questions_count: int) -> int:
+        if questions_count <= 0:
+            return 0
+        ratio = answers_count / questions_count
+        if ratio > 0.4:
+            return 2
+        if ratio > 0.2:
+            return 1
+        return 0
+
+    created_at = generation.get("created_at")
+    date_text = ""
+    if created_at:
+        try:
+            date_text = datetime.fromisoformat(str(created_at).replace("Z", "+00:00")).strftime("%d.%m.%Y")
+        except Exception:
+            date_text = clean(created_at)
+
+    total_questions = len(questions_fragments)
+    total_answers = len(answers_fragments)
+    total_examples = len(examples_fragments)
+    total_events = len(timeline_items)
+    has_intro = bool(goals.get("intro", {}).get("present")) if isinstance(goals.get("intro"), dict) else False
+    has_summary = bool(goals.get("summary", {}).get("present")) if isinstance(goals.get("summary"), dict) else False
+    has_profanity = bool(profanity_block.get("present"))
+    has_familiarity = bool(familiarity_block.get("present"))
+
+    question_type_counts: dict[str, int] = {}
+    question_type_fragments: dict[str, list[dict[str, Any]]] = {}
+    seen_question_keys: set[str] = set()
+    for fragment in questions_fragments:
+        if not isinstance(fragment, dict):
+            continue
+        unique_key = f"{fragment.get('start_ms', '')}|{fragment.get('end_ms', '')}|{clean(fragment.get('text'))}"
+        if unique_key in seen_question_keys:
+            continue
+        seen_question_keys.add(unique_key)
+        qtype = clean(fragment.get("question_type")).casefold() or "other"
+        question_type_counts[qtype] = question_type_counts.get(qtype, 0) + 1
+        question_type_fragments.setdefault(qtype, []).append(fragment)
+
+    rows: list[dict[str, Any]] = [
+        {"cells": [{"value": "Чек-лист качества преподавания на занятии", "style": 2, "span": 5}], "height": 24},
+        {"cells": [{"value": "Заполняйте только по фактам из анализа. Пустые ячейки лучше оставлять пустыми, если в данных нет подтверждения.", "style": 7, "span": 5}], "height": 34},
+        {"cells": [{"value": "Дата формирования", "style": 14, "span": 1}, {"value": date_text, "style": 5, "span": 2}, {"value": "Файл", "style": 14, "span": 1}, {"value": clean(generation.get("file_name")), "style": 5, "span": 1}], "height": 20},
+        {"cells": [{"value": "Формат занятия", "style": 14, "span": 1}, {"value": clean(lesson_format.get("format")), "style": 5, "span": 4}], "height": 20},
+        {"cells": [], "height": 6},
+        {"cells": [{"value": "Легенда", "style": 4, "span": 5}], "height": 20},
+        {"cells": [{"value": "Баллы", "style": 1}, {"value": "Смысл", "style": 1}, {"value": "Проявление", "style": 1}, {"value": "", "style": 1}, {"value": "", "style": 1}], "height": 20},
+        {"cells": [{"value": "0", "style": 11}, {"value": "Отсутствие или несоответствие", "style": 5}, {"value": "Показатель не подтвержден", "style": 5}, {"value": "", "style": 5}, {"value": "", "style": 5}], "height": 22},
+        {"cells": [{"value": "1", "style": 12}, {"value": "Частичное соответствие", "style": 5}, {"value": "Показатель подтвержден частично", "style": 5}, {"value": "", "style": 5}, {"value": "", "style": 5}], "height": 22},
+        {"cells": [{"value": "2", "style": 13}, {"value": "Полное соответствие", "style": 5}, {"value": "Показатель подтвержден", "style": 5}, {"value": "", "style": 5}, {"value": "", "style": 5}], "height": 22},
+        {"cells": [], "height": 8},
+        {"cells": [{"value": "Анализ по индикаторам", "style": 4, "span": 5}], "height": 20},
+    ]
+
+    def add_section(title: str, rows_to_add: list[dict[str, Any]]) -> None:
+        if not rows_to_add:
+            return
+        rows.append({"cells": [{"value": title, "style": 8, "span": 5}], "height": 22})
+        rows.append({"cells": [{"value": "Компетенция", "style": 1}, {"value": "Поведенческие индикаторы", "style": 1}, {"value": "Проявление", "style": 1}, {"value": "Баллы", "style": 1}, {"value": "Дополнительные комментарии", "style": 1}], "height": 20})
+        rows.extend(rows_to_add)
+
+    engagement_rows: list[dict[str, Any]] = []
+    for qtype in question_type_order:
+        count = question_type_counts.get(qtype, 0)
+        if not count:
+            continue
+        fragments_for_type = question_type_fragments.get(qtype, [])
+        engagement_rows.append({
+            "cells": [
+                {"value": "Вопросы преподавателя", "style": 14},
+                {"value": question_type_labels.get(qtype, qtype), "style": 5},
+                {"value": f"{count} из {total_questions} ({percentage(count, total_questions)})", "style": 5},
+                {"value": point(question_points(count)), "style": 13 if count > 0 else 11},
+                {"value": join_comments(fragments_for_type), "style": 5},
+            ],
+            "height": 26,
+        })
+    if total_questions and total_answers:
+        engagement_rows.append({
+            "cells": [
+                {"value": "Создание благоприятной атмосферы", "style": 14},
+                {"value": "Ответы студентов", "style": 5},
+                {"value": f"{total_answers} из {total_questions} ({percentage(total_answers, total_questions)})", "style": 5},
+                {"value": point(atmosphere_points(total_answers, total_questions)), "style": 12 if atmosphere_points(total_answers, total_questions) == 1 else 13 if atmosphere_points(total_answers, total_questions) == 2 else 11},
+                {"value": join_comments(answers_fragments), "style": 5},
+            ],
+            "height": 26,
+        })
+    add_section("Вовлечение аудитории", engagement_rows)
+
+    structure_rows: list[dict[str, Any]] = []
+    if total_events:
+        timeline_comment = "\n".join(
+            f"{clean(item.get('time') or '')} · {clean(item.get('title'))}{(' — ' + clean(item.get('comment'))) if clean(item.get('comment')) else ''}"
+            for item in timeline_items
+            if isinstance(item, dict)
+        )
+        structure_rows.append({
+            "cells": [
+                {"value": "Таймлайн урока", "style": 14},
+                {"value": "Последовательность этапов", "style": 5},
+                {"value": f"{total_events} событий", "style": 5},
+                {"value": point(2 if total_events >= 2 else 1), "style": 13 if total_events >= 2 else 12},
+                {"value": timeline_comment, "style": 5},
+            ],
+            "height": 34,
+        })
+    structure_rows.append({
+        "cells": [
+            {"value": "Цели и итоги урока", "style": 14},
+            {"value": "Введение", "style": 5},
+            {"value": "есть" if has_intro else "нет", "style": 5},
+            {"value": point(2 if has_intro else 0), "style": 13 if has_intro else 11},
+            {"value": clean(goals.get("intro", {}).get("comment") if isinstance(goals.get("intro"), dict) else ""), "style": 5},
+        ],
+        "height": 24,
+    })
+    structure_rows.append({
+        "cells": [
+            {"value": "Цели и итоги урока", "style": 14},
+            {"value": "Завершение", "style": 5},
+            {"value": "есть" if has_summary else "нет", "style": 5},
+            {"value": point(2 if has_summary else 0), "style": 13 if has_summary else 11},
+            {"value": clean(goals.get("summary", {}).get("comment") if isinstance(goals.get("summary"), dict) else ""), "style": 5},
+        ],
+        "height": 24,
+    })
+    add_section("Структура занятия", structure_rows)
+
+    explanation_rows: list[dict[str, Any]] = []
+    for fragment in examples_fragments:
+        if not isinstance(fragment, dict):
+            continue
+        explanation_rows.append({
+            "cells": [
+                {"value": example_type_label(fragment), "style": 14},
+                {"value": "Пример из речи преподавателя", "style": 5},
+                {"value": fragment_manifestation(fragment), "style": 5},
+                {"value": "-", "style": 5},
+                {"value": fragment_comment(fragment), "style": 5},
+            ],
+            "height": 26,
+        })
+    add_section("Примеры, аналогии и сторителлинг", explanation_rows)
+
+    flag_rows: list[dict[str, Any]] = []
+    if has_profanity or profanity_fragments:
+        flag_rows.append({
+            "cells": [
+                {"value": "Ненормативная лексика", "style": 14},
+                {"value": "Тон и лексика", "style": 5},
+                {"value": "не подтверждено" if not has_profanity else "есть сигналы", "style": 5},
+                {"value": point(2 if not has_profanity and not profanity_fragments else 0), "style": 13 if not has_profanity and not profanity_fragments else 11},
+                {"value": join_comments(profanity_fragments), "style": 5},
+            ],
+            "height": 26,
+        })
+    if has_familiarity or familiarity_fragments:
+        flag_rows.append({
+            "cells": [
+                {"value": "Панибратство", "style": 14},
+                {"value": "Обращение к аудитории", "style": 5},
+                {"value": "не подтверждено" if not has_familiarity else "есть сигналы", "style": 5},
+                {"value": point(2 if not has_familiarity and not familiarity_fragments else 0), "style": 13 if not has_familiarity and not familiarity_fragments else 11},
+                {"value": join_comments(familiarity_fragments), "style": 5},
+            ],
+            "height": 26,
+        })
+    add_section("Флаги", flag_rows)
+
+    recommendation_comment = clean(teacher_recommendation.get("comment"))
+    recommendation_rows: list[dict[str, Any]] = []
+    if recommendation_comment:
+        recommendation_rows.append({
+            "cells": [
+                {"value": "Рекомендация преподавателю", "style": 14},
+                {"value": "Комментарий", "style": 5},
+                {"value": recommendation_comment, "style": 5},
+                {"value": "", "style": 5},
+                {"value": "", "style": 5},
+            ],
+            "height": 30,
+        })
+    add_section("Рекомендация преподавателю", recommendation_rows)
+
+    return [
+        {
+            "name": "Анализ речи",
+            "rows": rows,
+            "cols": [22, 28, 34, 12, 44],
+            "page_setup": {"orientation": "landscape", "paperSize": 9, "fitToWidth": 1, "fitToHeight": 1},
+            "freeze_panes": "A12",
+        }
+    ]
 
 
 def quiz_subtopics(quiz: list[dict[str, Any]]) -> list[str]:
@@ -1335,10 +2806,12 @@ def refresh_generation_analytics(generation_id: str) -> dict[str, Any]:
     conn.close()
     analytics = analytics_from_attempts(generation_id, generation.get("quiz", []), attempts)
     if not attempts and not analytics.get("mastery"):
-        analytics = build_analytics(generation_id, generation.get("quiz", []))
+        analytics = build_analytics(generation_id, generation.get("quiz", []), speech_analysis_from_generation(generation))
         analytics["studentsCompleted"] = 0
         analytics["mastery"] = []
         analytics["recommendations"] = []
+    else:
+        analytics = merge_speech_analysis_into_analytics(analytics, speech_analysis_from_generation(generation))
     update_generation(generation_id, {"analytics": analytics}, broadcast_event_type="generation_analytics_updated")
     return analytics
 
@@ -1527,30 +3000,182 @@ def transcript_to_chunks(transcript: list[dict[str, Any]]) -> list[dict[str, Any
     return chunks
 
 
+def _flatten_transcript_phrases(transcript_chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    phrases: list[dict[str, Any]] = []
+    sorted_chunks = sorted(transcript_chunks, key=lambda item: int(item.get("start_ms", 0) or 0))
+    for chunk in sorted_chunks:
+        if not isinstance(chunk, dict):
+            continue
+        chunk_start_ms = int(chunk.get("start_ms", 0) or 0)
+        transcript = chunk.get("transcript")
+        if not isinstance(transcript, list):
+            continue
+        for phrase in transcript:
+            if not isinstance(phrase, dict):
+                continue
+            text = str(phrase.get("text") or "").strip()
+            if not text:
+                continue
+            try:
+                start_ms = int(phrase.get("start_ms", chunk_start_ms) or chunk_start_ms)
+            except (TypeError, ValueError):
+                start_ms = chunk_start_ms
+            phrases.append({"start_ms": start_ms, "text": text})
+    phrases.sort(key=lambda item: int(item.get("start_ms", 0) or 0))
+    return phrases
+
+
+def _build_overlapped_time_groups(
+    transcript_chunks: list[dict[str, Any]],
+    *,
+    target_seconds: int,
+    min_seconds: int,
+    max_seconds: int,
+    overlap_phrases: int = 3,
+) -> list[dict[str, Any]]:
+    flat_phrases = _flatten_transcript_phrases(transcript_chunks)
+    if not flat_phrases:
+        return []
+
+    target_ms = max(1, target_seconds) * 1000
+    min_ms = max(1, min_seconds) * 1000
+    max_ms = max(min_ms, max_seconds * 1000)
+    overlap = max(0, int(overlap_phrases))
+
+    def make_group(
+        phrases: list[dict[str, Any]],
+        chunk_id: int,
+        *,
+        start_ms: int | None = None,
+        end_ms: int | None = None,
+    ) -> dict[str, Any]:
+        selected_start_ms = int(phrases[0].get("start_ms", 0) or 0)
+        selected_end_ms = int(phrases[-1].get("start_ms", selected_start_ms) or selected_start_ms)
+        start_value = selected_start_ms if start_ms is None else int(start_ms)
+        end_value = selected_end_ms if end_ms is None else int(end_ms)
+        if end_value < start_value:
+            end_value = start_value
+        return {
+            "chunk_id": chunk_id,
+            "start_time": format_timestamp(start_value / 1000),
+            "end_time": format_timestamp(end_value / 1000),
+            "start_ms": start_value,
+            "end_ms": end_value,
+            "transcript": [
+                {
+                    "start_ms": int(item.get("start_ms", start_value) or start_value),
+                    "text": item.get("text", ""),
+                }
+                for item in phrases
+            ],
+        }
+
+    def duration_ms(start_idx: int, end_idx: int) -> int:
+        if end_idx <= start_idx:
+            return 0
+        start_ms = int(flat_phrases[start_idx].get("start_ms", 0) or 0)
+        end_ms = int(flat_phrases[end_idx - 1].get("start_ms", start_ms) or start_ms)
+        return max(0, end_ms - start_ms)
+
+    def choose_cut_index(start_idx: int, end_idx: int, target_duration_ms: int) -> int:
+        if end_idx - start_idx <= 1:
+            return end_idx
+        start_ms = int(flat_phrases[start_idx].get("start_ms", 0) or 0)
+        end_ms = int(flat_phrases[end_idx - 1].get("start_ms", start_ms) or start_ms)
+        span_ms = max(0, end_ms - start_ms)
+        if span_ms <= 0:
+            return start_idx + max(1, (end_idx - start_idx) // 2)
+        target_cut_ms = start_ms + min(target_duration_ms, span_ms)
+        best_idx = start_idx + 1
+        best_distance = float("inf")
+        for cut_idx in range(start_idx + 1, end_idx):
+            cut_ms = int(flat_phrases[cut_idx].get("start_ms", start_ms) or start_ms)
+            distance = abs(cut_ms - target_cut_ms)
+            if distance < best_distance:
+                best_distance = distance
+                best_idx = cut_idx
+        return best_idx
+
+    core_ranges: list[tuple[int, int]] = []
+    start_idx = 0
+    while start_idx < len(flat_phrases):
+        best_end = -1
+        best_score = float("inf")
+        end_idx = start_idx + 1
+
+        while end_idx <= len(flat_phrases):
+            current_duration_ms = duration_ms(start_idx, end_idx)
+            if current_duration_ms > max_ms and end_idx > start_idx + 1:
+                break
+            if current_duration_ms >= min_ms:
+                score = abs(current_duration_ms - target_ms)
+                if score < best_score:
+                    best_score = score
+                    best_end = end_idx
+            end_idx += 1
+
+        if best_end < 0:
+            remaining_duration_ms = duration_ms(start_idx, len(flat_phrases))
+            if remaining_duration_ms <= max_ms and remaining_duration_ms > 0:
+                best_end = len(flat_phrases)
+            else:
+                best_end = choose_cut_index(start_idx, len(flat_phrases), target_ms)
+
+        if best_end <= start_idx:
+            best_end = min(len(flat_phrases), start_idx + 1)
+
+        core_ranges.append((start_idx, best_end))
+        start_idx = best_end
+
+    if len(core_ranges) > 1:
+        last_start, last_end = core_ranges[-1]
+        last_duration_ms = duration_ms(last_start, last_end)
+        if last_duration_ms > 0 and last_duration_ms < min_ms:
+            prev_start, prev_end = core_ranges[-2]
+            combined_start = prev_start
+            combined_end = last_end
+            if duration_ms(combined_start, combined_end) <= max_ms:
+                core_ranges[-2] = (combined_start, combined_end)
+                core_ranges.pop()
+
+    groups: list[dict[str, Any]] = []
+    for idx, (core_start, core_end) in enumerate(core_ranges, start=1):
+        payload_start = max(0, core_start - overlap)
+        payload_end = min(len(flat_phrases), core_end + overlap)
+        core_start_ms = int(flat_phrases[core_start].get("start_ms", 0) or 0)
+        core_end_ms = int(flat_phrases[core_end - 1].get("start_ms", core_start_ms) or core_start_ms)
+        groups.append(
+            make_group(
+                flat_phrases[payload_start:payload_end],
+                idx,
+                start_ms=core_start_ms,
+                end_ms=core_end_ms,
+            )
+        )
+
+    return groups
+
+
 def transcript_to_summary_groups(
     transcript_chunks: list[dict[str, Any]],
 ) -> list[dict[str, Any]]:
-    grouped_chunks: list[dict[str, Any]] = []
-    sorted_chunks = sorted(transcript_chunks, key=lambda item: int(item.get("start_ms", 0) or 0))
-    for chunk in sorted_chunks:
-        if not chunk:
-            continue
-        transcript: list[dict[str, Any]] = []
-        transcript.extend(chunk.get("transcript", []))
-        transcript.sort(key=lambda item: int(item.get("start_ms", 0) or 0))
-        start_ms = int(chunk.get("start_ms", 0) or 0)
-        end_ms = int(chunk.get("end_ms", start_ms) or start_ms)
-        grouped_chunks.append(
-            {
-                "chunk_id": int(chunk.get("chunk_id", 1) or 1),
-                "start_time": format_timestamp(start_ms / 1000),
-                "end_time": format_timestamp(end_ms / 1000),
-                "start_ms": start_ms,
-                "end_ms": end_ms,
-                "transcript": transcript,
-            }
-        )
-    return grouped_chunks
+    return _build_overlapped_time_groups(
+        transcript_chunks,
+        target_seconds=SPEECH_ANALYSIS_GROUP_TARGET_SECONDS,
+        min_seconds=SPEECH_ANALYSIS_GROUP_MIN_SECONDS,
+        max_seconds=SPEECH_ANALYSIS_GROUP_MAX_SECONDS,
+        overlap_phrases=SPEECH_ANALYSIS_GROUP_OVERLAP_PHRASES,
+    )
+
+
+def transcript_to_teacher_analysis_groups(transcript_chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return _build_overlapped_time_groups(
+        transcript_chunks,
+        target_seconds=SPEECH_ANALYSIS_GROUP_TARGET_SECONDS,
+        min_seconds=SPEECH_ANALYSIS_GROUP_MIN_SECONDS,
+        max_seconds=SPEECH_ANALYSIS_GROUP_MAX_SECONDS,
+        overlap_phrases=SPEECH_ANALYSIS_GROUP_OVERLAP_PHRASES,
+    )
 
 
 def log_summary_payload(summary_groups: list[dict[str, Any]], label: str) -> None:
@@ -1585,6 +3210,18 @@ def log_final_summary(summary: list[dict[str, Any]], label: str) -> None:
         subtopic = str(section.get("subtopic") or f"Раздел {idx}").strip()
         content = " ".join(str(section.get("content", "") or "").split())
         print(f"[summary] {label} #{idx}: subtopic={subtopic!r}, content_preview={content[:220]!r}")
+
+
+def transcript_chunk_payloads(transcript_chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    payloads: list[dict[str, Any]] = []
+    for chunk in transcript_chunks:
+        if not isinstance(chunk, dict):
+            continue
+        if isinstance(chunk.get("transcript_chunk"), dict):
+            payloads.append(chunk["transcript_chunk"])
+        elif isinstance(chunk.get("transcript"), list):
+            payloads.append(chunk)
+    return payloads
 
 
 def transcript_from_transcription_results(transcription_results: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -1770,7 +3407,8 @@ async def build_summary_and_quiz(
     ml_client: MLServiceClient,
     transcript_chunks: list[dict[str, Any]],
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    summary_groups = transcript_to_summary_groups([chunk["transcript_chunk"] for chunk in transcript_chunks])
+    summary_source = transcript_chunk_payloads(transcript_chunks)
+    summary_groups = transcript_to_summary_groups(summary_source)
     log_summary_payload(summary_groups, "build_summary_and_quiz")
     mini_summaries = await asyncio.gather(*(ml_client.make_mini_summary(chunk) for chunk in summary_groups))
     summary = await ml_client.make_lesson_summary(list(mini_summaries))
@@ -1778,9 +3416,99 @@ async def build_summary_and_quiz(
     quiz = shuffle_quiz_options(await ml_client.make_quiz(summary))
     transcript: list[dict[str, Any]] = []
     for chunk in transcript_chunks:
-        transcript.extend(chunk["phrases"])
+        if not isinstance(chunk, dict):
+            continue
+        phrases = chunk.get("phrases") if isinstance(chunk.get("phrases"), list) else chunk.get("transcript")
+        if isinstance(phrases, list):
+            transcript.extend(phrases)
     transcript.sort(key=lambda item: (int(item.get("start_ms", 0) or 0), int(item.get("chunk_id", 0) or 0)))
     return transcript, list(mini_summaries), summary, quiz
+
+
+async def build_teacher_analysis(
+    ml_client: MLServiceClient,
+    transcript_chunks: list[dict[str, Any]],
+) -> dict[str, Any]:
+    analysis_source = transcript_to_teacher_analysis_groups(transcript_chunks)
+    if not analysis_source:
+        return {}
+    log_summary_payload(analysis_source, "build_teacher_analysis")
+    analysis_tasks = [asyncio.create_task(ml_client.make_teacher_analysis(chunk)) for chunk in analysis_source]
+    chunk_analyses = await asyncio.gather(*analysis_tasks)
+    aggregate = await ml_client.make_teacher_analysis_aggregate(list(chunk_analyses))
+    if isinstance(aggregate, dict):
+        aggregate["chunk_analyses"] = list(chunk_analyses)
+    return aggregate if isinstance(aggregate, dict) else {}
+
+
+async def build_summary_quiz_and_speech_analysis(
+    ml_client: MLServiceClient,
+    transcript_chunks: list[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], str]:
+    summary_task = asyncio.create_task(build_summary_and_quiz(ml_client, transcript_chunks))
+    speech_task = asyncio.create_task(build_teacher_analysis(ml_client, transcript_chunks))
+    try:
+        transcript, mini_summaries, summary, quiz = await summary_task
+    except Exception:
+        speech_task.cancel()
+        await asyncio.gather(speech_task, return_exceptions=True)
+        raise
+
+    speech_analysis: dict[str, Any] = {}
+    speech_error = ""
+    try:
+        speech_analysis = await speech_task
+    except Exception as exc:
+        print("Teacher analysis failed:", exc)
+        speech_analysis = {}
+        speech_error = make_user_error_message(exc)
+
+    return transcript, mini_summaries, summary, quiz, speech_analysis, speech_error
+
+
+async def run_speech_analysis_retry_pipeline(generation_id: str) -> None:
+    current = get_generation(generation_id)
+    if not current:
+        return
+    if not ML_API_KEY:
+        raise RuntimeError("ML_API_KEY is empty")
+    transcript = current.get("transcript", [])
+    transcript_chunks = transcript_to_chunks(transcript if isinstance(transcript, list) else [])
+    analysis_source = transcript_to_teacher_analysis_groups(transcript_chunks)
+    if not analysis_source:
+        raise MLServiceError(
+            "Retry requested without saved transcript",
+            "Не найден сохраненный транскрипт для анализа речи преподавателя. Загрузите файл заново.",
+        )
+
+    ml_client = MLServiceClient(api_key=ML_API_KEY, base_url=ML_URL)
+    existing_analytics = current.get("analytics") if isinstance(current.get("analytics"), dict) else {}
+    if existing_analytics:
+        analytics = dict(existing_analytics)
+    else:
+        analytics = build_analytics(generation_id, current.get("quiz", []))
+
+    try:
+        speech_analysis = await build_teacher_analysis(ml_client, transcript_chunks)
+        if not speech_analysis:
+            raise MLServiceError(
+                "Teacher analysis retry returned empty result",
+                "Не удалось заново собрать анализ речи преподавателя. Попробуйте еще раз.",
+            )
+        analytics["speech_analysis"] = speech_analysis
+        analytics.pop("speech_analysis_error", None)
+    except Exception as exc:
+        analytics["speech_analysis_error"] = make_user_error_message(exc)
+
+    update_generation(
+        generation_id,
+        {
+            "status": "completed",
+            "progress_percent": 100,
+            "analytics": analytics,
+            "error_message": "",
+        },
+    )
 
 
 async def run_ml_retry_pipeline(generation_id: str) -> None:
@@ -1788,31 +3516,42 @@ async def run_ml_retry_pipeline(generation_id: str) -> None:
         current = get_generation(generation_id)
         if not current:
             return
-        update_generation(generation_id, {"status": "processing", "progress_percent": 100, "error_message": ""})
         if not ML_API_KEY:
             raise RuntimeError("ML_API_KEY is empty")
 
         ml_client = MLServiceClient(api_key=ML_API_KEY, base_url=ML_URL)
         summary = current.get("summary", [])
-        if not summary:
-            transcript = current.get("transcript", [])
-            summary_groups = transcript_to_summary_groups(transcript_to_chunks(transcript if isinstance(transcript, list) else []))
-            if not summary_groups:
-                raise MLServiceError(
-                    "Retry requested without saved transcript",
-                    "Не найден сохраненный транскрипт для повторной генерации. Загрузите файл заново.",
-                )
-            log_summary_payload(summary_groups, "run_ml_retry_pipeline")
-            mini_summaries = await asyncio.gather(*(ml_client.make_mini_summary(chunk) for chunk in summary_groups))
-            update_generation(generation_id, {"mini_summary": list(mini_summaries)})
-            summary = await ml_client.make_lesson_summary(mini_summaries)
-            log_final_summary(summary, "run_ml_retry_pipeline")
-            update_generation(generation_id, {"summary": summary})
+        quiz = current.get("quiz", [])
+        transcript = current.get("transcript", [])
+        transcript_chunks = transcript_to_chunks(transcript if isinstance(transcript, list) else [])
+        summary_groups = transcript_to_summary_groups(transcript_chunks)
+        if not summary_groups:
+            raise MLServiceError(
+                "Retry requested without saved transcript",
+                "Не найден сохраненный транскрипт для повторной генерации. Загрузите файл заново.",
+            )
 
-        quiz = shuffle_quiz_options(await ml_client.make_quiz(summary))
+        if isinstance(summary, list) and summary and isinstance(quiz, list) and quiz:
+            await run_speech_analysis_retry_pipeline(generation_id)
+            return
+
+        update_generation(generation_id, {"status": "processing", "progress_percent": 100, "error_message": ""})
+        log_summary_payload(summary_groups, "run_ml_retry_pipeline")
+        transcript, mini_summaries, summary, quiz, speech_analysis, speech_error = await build_summary_quiz_and_speech_analysis(ml_client, transcript_chunks)
+        log_final_summary(summary, "run_ml_retry_pipeline")
+        analytics = build_analytics(generation_id, quiz, speech_analysis, speech_error)
         update_generation(
             generation_id,
-            {"status": "completed", "progress_percent": 100, "quiz": quiz, "analytics": build_analytics(generation_id, quiz), "error_message": ""},
+            {
+                "status": "completed",
+                "progress_percent": 100,
+                "mini_summary": list(mini_summaries),
+                "summary": summary,
+                "quiz": quiz,
+                "transcript": transcript,
+                "analytics": analytics,
+                "error_message": "",
+            },
         )
     except Exception as e:
         update_generation(generation_id, {"status": "failed", "error_message": make_user_error_message(e)})
@@ -1837,16 +3576,15 @@ async def finalize_generation_from_transcript(generation_id: str, transcript: li
         if not ML_API_KEY:
             raise RuntimeError("ML_API_KEY is empty")
         ml_client = MLServiceClient(api_key=ML_API_KEY, base_url=ML_URL)
-        summary_groups = transcript_to_summary_groups(transcript_to_chunks(transcript if isinstance(transcript, list) else []))
+        transcript_chunks = transcript_to_chunks(transcript if isinstance(transcript, list) else [])
+        summary_groups = transcript_to_summary_groups(transcript_chunks)
         if not summary_groups:
             raise MLServiceError("Cached transcript is empty", "Не удалось получить транскрипт из файла. Попробуйте другой файл.")
 
         log_summary_payload(summary_groups, "finalize_generation_from_transcript")
-        mini_summaries = await asyncio.gather(*(ml_client.make_mini_summary(chunk) for chunk in summary_groups))
-        update_generation(generation_id, {"mini_summary": list(mini_summaries)})
-        summary = await ml_client.make_lesson_summary(mini_summaries)
+        transcript, mini_summaries, summary, quiz, speech_analysis, speech_error = await build_summary_quiz_and_speech_analysis(ml_client, transcript_chunks)
         log_final_summary(summary, "finalize_generation_from_transcript")
-        quiz = shuffle_quiz_options(await ml_client.make_quiz(summary))
+        analytics = build_analytics(generation_id, quiz, speech_analysis, speech_error)
 
         update_generation(
             generation_id,
@@ -1854,9 +3592,10 @@ async def finalize_generation_from_transcript(generation_id: str, transcript: li
                 "status": "completed",
                 "progress_percent": 100,
                 "transcript": transcript,
+                "mini_summary": mini_summaries,
                 "summary": summary,
                 "quiz": quiz,
-                "analytics": build_analytics(generation_id, quiz),
+                "analytics": analytics,
                 "error_message": "",
             },
         )
@@ -1889,7 +3628,8 @@ async def run_generation_pipeline(generation_id: str, file_bytes: bytes, file_na
         if content_hash:
             store_cached_transcript(content_hash, transcript_from_transcription_results(transcription_results))
 
-        transcript, mini_summaries, summary, quiz = await build_summary_and_quiz(ml_client, transcription_results)
+        transcript, mini_summaries, summary, quiz, speech_analysis, speech_error = await build_summary_quiz_and_speech_analysis(ml_client, transcription_results)
+        analytics = build_analytics(generation_id, quiz, speech_analysis, speech_error)
 
         update_generation(
             generation_id,
@@ -1900,7 +3640,7 @@ async def run_generation_pipeline(generation_id: str, file_bytes: bytes, file_na
                 "mini_summary": mini_summaries,
                 "summary": summary,
                 "quiz": quiz,
-                "analytics": build_analytics(generation_id, quiz),
+                "analytics": analytics,
                 "error_message": "",
             },
         )
@@ -1974,8 +3714,63 @@ async def api_generation_retry(request: Request, background_tasks: BackgroundTas
     if not generation.get("transcript"):
         raise HTTPException(status_code=400, detail="Нет сохраненного транскрипта для повторной генерации.")
 
-    background_tasks.add_task(run_ml_retry_pipeline, generation_id)
+    await run_ml_retry_pipeline(generation_id)
     return {"ok": True}
+
+
+@app.get("/api/generations/{generation_id}/speech-analysis.xlsx")
+async def api_generation_speech_analysis_export(request: Request, generation_id: str):
+    user_id = ensure_guest_user(request)
+    conn = db_conn()
+    row = conn.execute("SELECT * FROM generations WHERE id = ? AND COALESCE(creator_id, user_id) = ?", (generation_id, user_id)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    generation = row_to_generation(row)
+    worksheets = build_speech_analysis_export_worksheets_precise(generation)
+    if not worksheets:
+        raise HTTPException(status_code=404, detail="Speech analysis unavailable")
+
+    xlsx_bytes = build_xlsx_bytes(worksheets)
+    file_name = f"speech_analysis_{generation_id[:12]}.xlsx"
+    return Response(
+        content=xlsx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{file_name}"'},
+    )
+
+
+@app.post("/api/generations/{generation_id}/speech-analysis.xlsx")
+async def api_generation_speech_analysis_export_from_payload(request: Request, generation_id: str):
+    user_id = ensure_guest_user(request)
+    conn = db_conn()
+    row = conn.execute("SELECT * FROM generations WHERE id = ? AND COALESCE(creator_id, user_id) = ?", (generation_id, user_id)).fetchone()
+    conn.close()
+    if not row:
+        raise HTTPException(status_code=404, detail="Not found")
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+    if not isinstance(payload, dict):
+        payload = {}
+
+    worksheets = build_speech_analysis_export_worksheets_from_payload(payload)
+    if not worksheets:
+        generation = row_to_generation(row)
+        worksheets = build_speech_analysis_export_worksheets_precise(generation)
+    if not worksheets:
+        raise HTTPException(status_code=404, detail="Speech analysis unavailable")
+
+    xlsx_bytes = build_xlsx_bytes(worksheets)
+    file_name = f"speech_analysis_{generation_id[:12]}.xlsx"
+    return Response(
+        content=xlsx_bytes,
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{file_name}"'},
+    )
 
 
 @app.get("/api/generations/{generation_id}")
