@@ -1600,6 +1600,8 @@ body.drawer-open {
 .speech-analysis-footer {
   display: flex;
   justify-content: flex-end;
+  gap: 0.6rem;
+  flex-wrap: wrap;
   margin-top: 0.25rem;
 }
 

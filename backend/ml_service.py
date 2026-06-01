@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import time
 from typing import Any, Optional
@@ -60,6 +61,8 @@ class MLServiceClient:
     def __init__(self, api_key: str, base_url: str = "https://ml.fastclass.ru") -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
+        self._unfinished_jobs: set[str] = set()
+        self._unfinished_jobs_lock = asyncio.Lock()
 
     def _headers(self, *, include_content_type: bool = True) -> dict[str, str]:
         if not self.api_key:
@@ -112,6 +115,44 @@ class MLServiceClient:
             return task
         return {}
 
+    @staticmethod
+    def _compact_preview(value: Any, limit: int = 600) -> str:
+        try:
+            text = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
+        except Exception:
+            text = repr(value)
+        if len(text) > limit:
+            return text[: limit - 3] + "..."
+        return text
+
+    async def _mark_job_started(self, request_name: str, job_id: str, request_preview: Any) -> None:
+        async with self._unfinished_jobs_lock:
+            self._unfinished_jobs.add(job_id)
+            unfinished_jobs = len(self._unfinished_jobs)
+        print(
+            "[ML submit]",
+            {
+                "request": request_name,
+                "job_id": job_id,
+                "unfinished_jobs": unfinished_jobs,
+                "payload": request_preview,
+            },
+        )
+
+    async def _mark_job_finished(self, request_name: str, job_id: str, response_preview: Any) -> None:
+        async with self._unfinished_jobs_lock:
+            self._unfinished_jobs.discard(job_id)
+            unfinished_jobs = len(self._unfinished_jobs)
+        print(
+            "[ML done]",
+            {
+                "request": request_name,
+                "job_id": job_id,
+                "unfinished_jobs": unfinished_jobs,
+                "response": response_preview,
+            },
+        )
+
     async def _post_json(self, path: str, payload: dict[str, Any], timeout_s: int) -> dict[str, Any]:
         url = f"{self.base_url}{path}"
         try:
@@ -150,6 +191,7 @@ class MLServiceClient:
             raise MLServiceError("ML task response has no task_type", "Сервис вернул некорректную задачу. Попробуйте позже.")
         if not isinstance(status, str) or not status.strip():
             raise MLServiceError("ML task response has no status", "Сервис вернул некорректную задачу. Попробуйте позже.")
+        await self._mark_job_started(path, job_id, self._compact_preview(payload))
         return task
 
     async def _submit_multipart_task(
@@ -193,6 +235,22 @@ class MLServiceClient:
             raise MLServiceError("ML task response has no task_type", "Сервис вернул некорректную задачу. Попробуйте позже.")
         if not isinstance(status, str) or not status.strip():
             raise MLServiceError("ML task response has no status", "Сервис вернул некорректную задачу. Попробуйте позже.")
+        file_meta: dict[str, Any] = {}
+        if "audio_file" in files:
+            file_name, file_bytes, mime_type = files["audio_file"]
+            file_meta = {
+                "file_name": file_name,
+                "mime_type": mime_type,
+                "bytes": len(file_bytes),
+            }
+        await self._mark_job_started(
+            path,
+            job_id,
+            self._compact_preview({
+                "data": data,
+                "files": file_meta,
+            }),
+        )
         return payload
 
     async def _get_task(self, job_id: str, timeout_s: int) -> dict[str, Any]:
@@ -265,6 +323,7 @@ class MLServiceClient:
         end_ms: int,
     ) -> list[dict[str, Any]]:
         audio_preview = f"{len(audio_bytes)} bytes"
+        task: dict[str, Any] = {}
         if os.getenv("ML_DEBUG_TRANSCRIBE_REQUESTS", "0") == "1":
             print(
                 "[ML transcribe_chunk] request payload",
@@ -289,67 +348,78 @@ class MLServiceClient:
             },
             timeout_s=300,
         )
-        task = await self._wait_for_task(task, timeout_s=3600)
-        data = self._task_result(task)
-        transcript = data.get("transcript")
-        if not isinstance(transcript, list) or not transcript:
-            print(
-                "[ML transcribe_chunk] unexpected response: transcript missing or empty",
-                {
-                    "file_name": file_name,
-                    "chunk_id": chunk_id,
-                    "start_ms": start_ms,
-                    "end_ms": end_ms,
-                    "response": data,
-                },
-            )
-            raise MLServiceError("Transcribe response has no transcript list", "Не удалось получить текст из аудио. Попробуйте другой файл.")
+        try:
+            task = await self._wait_for_task(task, timeout_s=3600)
+            data = self._task_result(task)
+            transcript = data.get("transcript")
+            if not isinstance(transcript, list) or not transcript:
+                print(
+                    "[ML transcribe_chunk] unexpected response: transcript missing or empty",
+                    {
+                        "file_name": file_name,
+                        "chunk_id": chunk_id,
+                        "start_ms": start_ms,
+                        "end_ms": end_ms,
+                        "response": data,
+                    },
+                )
+                raise MLServiceError("Transcribe response has no transcript list", "Не удалось получить текст из аудио. Попробуйте другой файл.")
 
-        normalized: list[dict[str, Any]] = []
-        for item in transcript:
-            if not isinstance(item, dict):
-                continue
-            text = str(item.get("text") or "").strip()
-            if not text:
-                continue
-            try:
-                start_value = int(item.get("start_ms", 0) or 0)
-            except (TypeError, ValueError):
-                start_value = 0
-            normalized.append({"start_ms": start_value, "text": _fix_json_escapes(text)})
-        if not normalized:
-            print(
-                "[ML transcribe_chunk] unexpected response: transcript items have no usable text",
-                {
-                    "file_name": file_name,
-                    "chunk_id": chunk_id,
-                    "start_ms": start_ms,
-                    "end_ms": end_ms,
-                    "response": data,
-                    "transcript": transcript,
-                },
-            )
-            raise MLServiceError("Transcribe response has no valid transcript items", "Не удалось получить текст из аудио. Попробуйте другой файл.")
-        return normalized
+            normalized: list[dict[str, Any]] = []
+            for item in transcript:
+                if not isinstance(item, dict):
+                    continue
+                text = str(item.get("text") or "").strip()
+                if not text:
+                    continue
+                try:
+                    start_value = int(item.get("start_ms", 0) or 0)
+                except (TypeError, ValueError):
+                    start_value = 0
+                normalized.append({"start_ms": start_value, "text": _fix_json_escapes(text)})
+            if not normalized:
+                print(
+                    "[ML transcribe_chunk] unexpected response: transcript items have no usable text",
+                    {
+                        "file_name": file_name,
+                        "chunk_id": chunk_id,
+                        "start_ms": start_ms,
+                        "end_ms": end_ms,
+                        "response": data,
+                        "transcript": transcript,
+                    },
+                )
+                raise MLServiceError("Transcribe response has no valid transcript items", "Не удалось получить текст из аудио. Попробуйте другой файл.")
+            return normalized
+        finally:
+            job_id = str(task.get("job_id") or "").strip()
+            if job_id:
+                await self._mark_job_finished("/transcribe-chunk", job_id, self._compact_preview(self._task_result(task)))
 
     async def _make_mini_summary_once(self, chunk_transcript: dict[str, Any]) -> dict[str, Any]:
+        task: dict[str, Any] = {}
         task = await self._submit_task("/mini-summary", chunk_transcript, timeout_s=120)
-        task = await self._wait_for_task(task, timeout_s=3600)
-        data = self._task_result(task)
-        key_points_raw = data.get("key_points")
-        key_points: list[str] = []
-        if isinstance(key_points_raw, list):
-            key_points = [_fix_json_escapes(str(item).strip()) for item in key_points_raw if str(item).strip()]
-        if not key_points:
-            raise MLServiceError("Mini-summary response has no key_points", "Сервис вернул пустой мини-конспект. Попробуйте повторить генерацию.")
-        return {
-            "chunk_id": chunk_transcript.get("chunk_id"),
-            "start_time": chunk_transcript.get("start_time"),
-            "end_time": chunk_transcript.get("end_time"),
-            "key_points": key_points,
-            "terms": data.get("terms") if isinstance(data.get("terms"), list) else [],
-            "examples": data.get("examples") if isinstance(data.get("examples"), list) else [],
-        }
+        try:
+            task = await self._wait_for_task(task, timeout_s=3600)
+            data = self._task_result(task)
+            key_points_raw = data.get("key_points")
+            key_points: list[str] = []
+            if isinstance(key_points_raw, list):
+                key_points = [_fix_json_escapes(str(item).strip()) for item in key_points_raw if str(item).strip()]
+            if not key_points:
+                raise MLServiceError("Mini-summary response has no key_points", "Сервис вернул пустой мини-конспект. Попробуйте повторить генерацию.")
+            return {
+                "chunk_id": chunk_transcript.get("chunk_id"),
+                "start_time": chunk_transcript.get("start_time"),
+                "end_time": chunk_transcript.get("end_time"),
+                "key_points": key_points,
+                "terms": data.get("terms") if isinstance(data.get("terms"), list) else [],
+                "examples": data.get("examples") if isinstance(data.get("examples"), list) else [],
+            }
+        finally:
+            job_id = str(task.get("job_id") or "").strip()
+            if job_id:
+                await self._mark_job_finished("/mini-summary", job_id, self._compact_preview(self._task_result(task)))
 
     async def make_mini_summary(self, chunk_transcript: dict[str, Any]) -> dict[str, Any]:
         return await self._make_mini_summary_once(chunk_transcript)
@@ -472,13 +542,19 @@ class MLServiceClient:
         }
 
     async def _make_teacher_analysis_once(self, chunk_transcript: dict[str, Any]) -> dict[str, Any]:
+        task: dict[str, Any] = {}
         task = await self._submit_task("/teacher-analysis", chunk_transcript, timeout_s=180)
-        task = await self._wait_for_task(task, timeout_s=3600)
-        data = self._task_result(task)
-        normalized = self._normalize_teacher_analysis_chunk(data)
-        if not normalized:
-          raise MLServiceError("Teacher analysis response is empty", "Сервис вернул пустой анализ речи преподавателя. Попробуйте повторить генерацию.")
-        return normalized
+        try:
+            task = await self._wait_for_task(task, timeout_s=3600)
+            data = self._task_result(task)
+            normalized = self._normalize_teacher_analysis_chunk(data)
+            if not normalized:
+                raise MLServiceError("Teacher analysis response is empty", "Сервис вернул пустой анализ речи преподавателя. Попробуйте повторить генерацию.")
+            return normalized
+        finally:
+            job_id = str(task.get("job_id") or "").strip()
+            if job_id:
+                await self._mark_job_finished("/teacher-analysis", job_id, self._compact_preview(self._task_result(task)))
 
     async def make_teacher_analysis(self, chunk_transcript: dict[str, Any]) -> dict[str, Any]:
         return await self._make_teacher_analysis_once(chunk_transcript)
@@ -487,15 +563,21 @@ class MLServiceClient:
         payload = {
             "chunk_analyses": [self._localize_teacher_analysis_chunk_for_aggregate(chunk) for chunk in chunk_analyses],
         }
+        task: dict[str, Any] = {}
         task = await self._submit_task("/teacher-analysis-aggregate", payload, timeout_s=240)
-        task = await self._wait_for_task(task, timeout_s=3600)
-        data = self._task_result(task)
-        if not isinstance(data, dict) or not data:
-            raise MLServiceError(
-                "Teacher analysis aggregate response is empty",
-                "Сервис вернул пустой агрегированный анализ речи преподавателя. Попробуйте повторить генерацию.",
-            )
-        return data
+        try:
+            task = await self._wait_for_task(task, timeout_s=3600)
+            data = self._task_result(task)
+            if not isinstance(data, dict) or not data:
+                raise MLServiceError(
+                    "Teacher analysis aggregate response is empty",
+                    "Сервис вернул пустой агрегированный анализ речи преподавателя. Попробуйте повторить генерацию.",
+                )
+            return data
+        finally:
+            job_id = str(task.get("job_id") or "").strip()
+            if job_id:
+                await self._mark_job_finished("/teacher-analysis-aggregate", job_id, self._compact_preview(self._task_result(task)))
 
     async def make_teacher_analysis_aggregate(self, chunk_analyses: list[dict[str, Any]]) -> dict[str, Any]:
         return await self._make_teacher_analysis_aggregate_once(chunk_analyses)
@@ -518,50 +600,62 @@ class MLServiceClient:
             "topic_hint": topic_hint,
             "key_points": key_points,
         }
+        task: dict[str, Any] = {}
         task = await self._submit_task("/lesson-summary", payload, timeout_s=180)
-        task = await self._wait_for_task(task, timeout_s=3600)
-        data = self._task_result(task)
-        summary = data.get("summary")
-        if not isinstance(summary, list) or not summary:
-            raise MLServiceError("Lesson summary response has no summary list", "Сервис вернул пустой конспект. Попробуйте повторить генерацию.")
+        try:
+            task = await self._wait_for_task(task, timeout_s=3600)
+            data = self._task_result(task)
+            summary = data.get("summary")
+            if not isinstance(summary, list) or not summary:
+                raise MLServiceError("Lesson summary response has no summary list", "Сервис вернул пустой конспект. Попробуйте повторить генерацию.")
 
-        normalized: list[dict[str, Any]] = []
-        for idx, item in enumerate(summary):
-            if not isinstance(item, dict):
-                continue
-            subtopic = _fix_json_escapes(str(item.get("subtopic") or f"Раздел {idx + 1}").strip())
-            content = _fix_json_escapes(str(item.get("content") or "").strip())
-            if not subtopic or not content:
-                continue
-            normalized.append({"subtopic": subtopic, "content": content})
-        if not normalized:
-            raise MLServiceError("Lesson summary response has no valid sections", "Сервис вернул пустой конспект. Попробуйте повторить генерацию.")
-        return normalized
+            normalized: list[dict[str, Any]] = []
+            for idx, item in enumerate(summary):
+                if not isinstance(item, dict):
+                    continue
+                subtopic = _fix_json_escapes(str(item.get("subtopic") or f"Раздел {idx + 1}").strip())
+                content = _fix_json_escapes(str(item.get("content") or "").strip())
+                if not subtopic or not content:
+                    continue
+                normalized.append({"subtopic": subtopic, "content": content})
+            if not normalized:
+                raise MLServiceError("Lesson summary response has no valid sections", "Сервис вернул пустой конспект. Попробуйте повторить генерацию.")
+            return normalized
+        finally:
+            job_id = str(task.get("job_id") or "").strip()
+            if job_id:
+                await self._mark_job_finished("/lesson-summary", job_id, self._compact_preview(self._task_result(task)))
 
     async def make_lesson_summary(self, mini_summaries: list[dict[str, Any]], topic_hint: str = "") -> list[dict[str, Any]]:
         return await self._make_lesson_summary_once(mini_summaries, topic_hint)
 
     async def make_practice_summary(self, payload: dict[str, Any]) -> list[dict[str, Any]]:
+        task: dict[str, Any] = {}
         task = await self._submit_task("/practice-summary", payload, timeout_s=180)
-        task = await self._wait_for_task(task, timeout_s=3600)
-        data = self._task_result(task)
-        summary = data.get("summary")
-        if not isinstance(summary, list) or not summary:
-            raise MLServiceError("Practice summary response has no summary list", "Сервис вернул пустой практический конспект. Попробуйте повторить генерацию.")
+        try:
+            task = await self._wait_for_task(task, timeout_s=3600)
+            data = self._task_result(task)
+            summary = data.get("summary")
+            if not isinstance(summary, list) or not summary:
+                raise MLServiceError("Practice summary response has no summary list", "Сервис вернул пустой практический конспект. Попробуйте повторить генерацию.")
 
-        normalized: list[dict[str, Any]] = []
-        for idx, item in enumerate(summary):
-            if not isinstance(item, dict):
-                continue
-            subtopic = _fix_json_escapes(str(item.get("subtopic") or f"Раздел {idx + 1}").strip())
-            content = _fix_json_escapes(str(item.get("content") or "").strip())
-            if not subtopic or not content:
-                continue
-            normalized.append({"subtopic": subtopic, "content": content})
+            normalized: list[dict[str, Any]] = []
+            for idx, item in enumerate(summary):
+                if not isinstance(item, dict):
+                    continue
+                subtopic = _fix_json_escapes(str(item.get("subtopic") or f"Раздел {idx + 1}").strip())
+                content = _fix_json_escapes(str(item.get("content") or "").strip())
+                if not subtopic or not content:
+                    continue
+                normalized.append({"subtopic": subtopic, "content": content})
 
-        if not normalized:
-            raise MLServiceError("Practice summary response has no valid sections", "Сервис вернул некорректный практический конспект. Попробуйте повторить генерацию.")
-        return normalized
+            if not normalized:
+                raise MLServiceError("Practice summary response has no valid sections", "Сервис вернул некорректный практический конспект. Попробуйте повторить генерацию.")
+            return normalized
+        finally:
+            job_id = str(task.get("job_id") or "").strip()
+            if job_id:
+                await self._mark_job_finished("/practice-summary", job_id, self._compact_preview(self._task_result(task)))
 
     async def make_quiz(
         self,
@@ -575,95 +669,107 @@ class MLServiceClient:
             "mcq_count": mcq_count,
             "open_count": open_count,
         }
+        task: dict[str, Any] = {}
         task = await self._submit_task("/quiz", payload, timeout_s=180)
-        task = await self._wait_for_task(task, timeout_s=3600)
-        data = self._task_result(task)
-        quiz = data.get("quiz")
-        if not isinstance(quiz, list) or not quiz:
-            raise MLServiceError("Quiz response has no quiz list", "Сервис вернул некорректный тест. Попробуйте повторить генерацию.")
+        try:
+            task = await self._wait_for_task(task, timeout_s=3600)
+            data = self._task_result(task)
+            quiz = data.get("quiz")
+            if not isinstance(quiz, list) or not quiz:
+                raise MLServiceError("Quiz response has no quiz list", "Сервис вернул некорректный тест. Попробуйте повторить генерацию.")
 
-        normalized: list[dict[str, Any]] = []
-        for idx, item in enumerate(quiz):
-            if not isinstance(item, dict):
-                continue
-            question_text = _fix_json_escapes(str(item.get("question_text") or "").strip())
-            if not question_text:
-                continue
-            question_type = str(item.get("question_type") or "multiple_choice").strip().casefold()
-            subtopic = _fix_json_escapes(str(item.get("subtopic") or f"Раздел {idx + 1}").strip()) or f"Раздел {idx + 1}"
-            explanation = _fix_json_escapes(str(item.get("explanation") or "").strip())
-            question_id = item.get("question_id")
-            if question_id in (None, ""):
-                question_id = idx + 1
+            normalized: list[dict[str, Any]] = []
+            for idx, item in enumerate(quiz):
+                if not isinstance(item, dict):
+                    continue
+                question_text = _fix_json_escapes(str(item.get("question_text") or "").strip())
+                if not question_text:
+                    continue
+                question_type = str(item.get("question_type") or "multiple_choice").strip().casefold()
+                subtopic = _fix_json_escapes(str(item.get("subtopic") or f"Раздел {idx + 1}").strip()) or f"Раздел {idx + 1}"
+                explanation = _fix_json_escapes(str(item.get("explanation") or "").strip())
+                question_id = item.get("question_id")
+                if question_id in (None, ""):
+                    question_id = idx + 1
 
-            if question_type == "multiple_choice":
-                options = item.get("options")
-                if not isinstance(options, list) or len(options) < 2:
+                if question_type == "multiple_choice":
+                    options = item.get("options")
+                    if not isinstance(options, list) or len(options) < 2:
+                        continue
+                    try:
+                        correct_answer = int(item.get("correct_answer"))
+                    except (TypeError, ValueError):
+                        continue
+                    if correct_answer < 0 or correct_answer >= len(options):
+                        continue
+                    normalized.append(
+                        {
+                            "question_id": int(question_id),
+                            "question_text": question_text,
+                            "question_type": "multiple_choice",
+                            "options": [_fix_json_escapes(str(option or "").strip()) for option in options],
+                            "correct_answer": correct_answer,
+                            "explanation": explanation,
+                            "subtopic": subtopic,
+                        }
+                    )
                     continue
-                try:
-                    correct_answer = int(item.get("correct_answer"))
-                except (TypeError, ValueError):
-                    continue
-                if correct_answer < 0 or correct_answer >= len(options):
-                    continue
-                normalized.append(
-                    {
-                        "question_id": int(question_id),
-                        "question_text": question_text,
-                        "question_type": "multiple_choice",
-                        "options": [_fix_json_escapes(str(option or "").strip()) for option in options],
-                        "correct_answer": correct_answer,
-                        "explanation": explanation,
-                        "subtopic": subtopic,
-                    }
-                )
-                continue
 
-            if question_type in {"open_ended", "open_question"}:
-                correct_answer = _fix_json_escapes(str(item.get("correct_answer") or "").strip())
-                if not correct_answer:
-                    continue
-                normalized.append(
-                    {
-                        "question_id": int(question_id),
-                        "question_text": question_text,
-                        "question_type": "open_ended",
-                        "options": None,
-                        "correct_answer": correct_answer,
-                        "explanation": explanation,
-                        "subtopic": subtopic,
-                    }
-                )
+                if question_type in {"open_ended", "open_question"}:
+                    correct_answer = _fix_json_escapes(str(item.get("correct_answer") or "").strip())
+                    if not correct_answer:
+                        continue
+                    normalized.append(
+                        {
+                            "question_id": int(question_id),
+                            "question_text": question_text,
+                            "question_type": "open_ended",
+                            "options": None,
+                            "correct_answer": correct_answer,
+                            "explanation": explanation,
+                            "subtopic": subtopic,
+                        }
+                    )
 
-        if not normalized:
-            raise MLServiceError("Quiz response has no valid question items", "Сервис вернул некорректный тест. Попробуйте повторить генерацию.")
-        return normalized
+            if not normalized:
+                raise MLServiceError("Quiz response has no valid question items", "Сервис вернул некорректный тест. Попробуйте повторить генерацию.")
+            return normalized
+        finally:
+            job_id = str(task.get("job_id") or "").strip()
+            if job_id:
+                await self._mark_job_finished("/quiz", job_id, self._compact_preview(self._task_result(task)))
 
     async def grade_open_answers(self, answers: list[dict[str, Any]]) -> dict[str, Any]:
         payload = {
             "answers": answers,
         }
+        task: dict[str, Any] = {}
         task = await self._submit_task("/grade-open-answers", payload, timeout_s=120)
-        task = await self._wait_for_task(task, timeout_s=3600)
-        data = self._task_result(task)
-        scores = data.get("scores")
-        if not isinstance(scores, list):
-            raise MLServiceError("Open answer grading response has no scores list", "Не удалось проверить открытые ответы.")
+        try:
+            task = await self._wait_for_task(task, timeout_s=3600)
+            data = self._task_result(task)
+            scores = data.get("scores")
+            if not isinstance(scores, list):
+                raise MLServiceError("Open answer grading response has no scores list", "Не удалось проверить открытые ответы.")
 
-        normalized_scores: list[dict[str, Any]] = []
-        for item in scores:
-            if not isinstance(item, dict):
-                continue
-            question_id = str(item.get("question_id") or "").strip()
-            if not question_id:
-                continue
-            try:
-                score = 1 if int(item.get("score", 0) or 0) else 0
-            except (TypeError, ValueError):
-                score = 0
-            normalized_scores.append({"question_id": question_id, "score": score})
+            normalized_scores: list[dict[str, Any]] = []
+            for item in scores:
+                if not isinstance(item, dict):
+                    continue
+                question_id = str(item.get("question_id") or "").strip()
+                if not question_id:
+                    continue
+                try:
+                    score = 1 if int(item.get("score", 0) or 0) else 0
+                except (TypeError, ValueError):
+                    score = 0
+                normalized_scores.append({"question_id": question_id, "score": score})
 
-        if not normalized_scores:
-            raise MLServiceError("Open answer grading response has no valid scores", "Не удалось проверить открытые ответы.")
+            if not normalized_scores:
+                raise MLServiceError("Open answer grading response has no valid scores", "Не удалось проверить открытые ответы.")
 
-        return {"scores": normalized_scores}
+            return {"scores": normalized_scores}
+        finally:
+            job_id = str(task.get("job_id") or "").strip()
+            if job_id:
+                await self._mark_job_finished("/grade-open-answers", job_id, self._compact_preview(self._task_result(task)))

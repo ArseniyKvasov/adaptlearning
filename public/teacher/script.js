@@ -2933,6 +2933,44 @@ function renderAnalytics(gen) {
       <div class="speech-subcard-text">${escapeHtml(String(comment || '').trim() || 'Комментарий отсутствует.')}</div>
     </section>
   `;
+  const renderAuxAnalyticsCards = () => `
+    <section class="analytics-card">
+      <div class="analytics-title">Ссылка для учеников</div>
+      <div class="analytics-link-wrap">
+        <div class="analytics-link">${escapeHtml(displayLink)}</div>
+      </div>
+      <div class="analytics-link-actions">
+        <button class="analytics-btn outline" type="button" onclick="openStudentLink('${escapeHtml(link)}')">Перейти</button>
+        <button class="analytics-btn filled" type="button" onclick="handleCopyStudentLink(this, '${escapeHtml(link)}')">Скопировать</button>
+      </div>
+      <div class="analytics-meta">Завершено попыток: ${completed}</div>
+    </section>
+
+    <section class="analytics-card ${completed ? '' : 'analytics-card-disabled'}">
+      <div class="analytics-title">Освоение подтем</div>
+      ${masteryHtml || '<div class="status-message">Результаты появятся после первого выполнения теста учеником.</div>'}
+    </section>
+
+    <section class="analytics-card ${completed ? '' : 'analytics-card-disabled'}">
+      <div class="analytics-title">Рекомендации</div>
+      <div class="analytics-reco-list">${completed ? recommendationsHtml : '<div class="analytics-reco muted">Пока нет данных для рекомендаций.</div>'}</div>
+    </section>
+  `;
+  if (speechRetryPending && !speechAnalysisTimedOut) {
+    analyticsContainer.innerHTML = `
+      <div class="analytics-stack">
+        ${renderSpeechAnalysisLoadingCard(gen, {
+          retry: true,
+          retryDisabled: true,
+          message: 'Повторно запрашиваем анализ речи преподавателя...'
+        })}
+
+        ${renderAuxAnalyticsCards()}
+      </div>
+    `;
+    setTimeout(() => renderMathInContainer(analyticsContainer), 30);
+    return;
+  }
 
   if (!hasSpeechAnalysis) {
     if (speechRetryPending) {
@@ -2945,27 +2983,7 @@ function renderAnalytics(gen) {
               message: 'Повторно запрашиваем анализ речи преподавателя...'
             })}
 
-            <section class="analytics-card">
-              <div class="analytics-title">Ссылка для учеников</div>
-              <div class="analytics-link-wrap">
-                <div class="analytics-link">${escapeHtml(displayLink)}</div>
-              </div>
-              <div class="analytics-link-actions">
-                <button class="analytics-btn outline" type="button" onclick="openStudentLink('${escapeHtml(link)}')">Перейти</button>
-                <button class="analytics-btn filled" type="button" onclick="handleCopyStudentLink(this, '${escapeHtml(link)}')">Скопировать</button>
-              </div>
-              <div class="analytics-meta">Завершено попыток: ${completed}</div>
-            </section>
-
-            <section class="analytics-card ${completed ? '' : 'analytics-card-disabled'}">
-              <div class="analytics-title">Освоение подтем</div>
-              ${masteryHtml || '<div class="status-message">Результаты появятся после первого выполнения теста учеником.</div>'}
-            </section>
-
-            <section class="analytics-card ${completed ? '' : 'analytics-card-disabled'}">
-              <div class="analytics-title">Рекомендации</div>
-              <div class="analytics-reco-list">${completed ? recommendationsHtml : '<div class="analytics-reco muted">Пока нет данных для рекомендаций.</div>'}</div>
-            </section>
+            ${renderAuxAnalyticsCards()}
           </div>
         `;
         setTimeout(() => renderMathInContainer(analyticsContainer), 30);
@@ -2995,27 +3013,7 @@ function renderAnalytics(gen) {
             )
           : renderSpeechAnalysisLoadingCard(gen, { retry: false, message: 'Ищем анализ речи преподавателя...' }))}
 
-        <section class="analytics-card">
-          <div class="analytics-title">Ссылка для учеников</div>
-          <div class="analytics-link-wrap">
-            <div class="analytics-link">${escapeHtml(displayLink)}</div>
-          </div>
-          <div class="analytics-link-actions">
-            <button class="analytics-btn outline" type="button" onclick="openStudentLink('${escapeHtml(link)}')">Перейти</button>
-            <button class="analytics-btn filled" type="button" onclick="handleCopyStudentLink(this, '${escapeHtml(link)}')">Скопировать</button>
-          </div>
-          <div class="analytics-meta">Завершено попыток: ${completed}</div>
-        </section>
-
-        <section class="analytics-card ${completed ? '' : 'analytics-card-disabled'}">
-          <div class="analytics-title">Освоение подтем</div>
-          ${masteryHtml || '<div class="status-message">Результаты появятся после первого выполнения теста учеником.</div>'}
-        </section>
-
-        <section class="analytics-card ${completed ? '' : 'analytics-card-disabled'}">
-          <div class="analytics-title">Рекомендации</div>
-          <div class="analytics-reco-list">${completed ? recommendationsHtml : '<div class="analytics-reco muted">Пока нет данных для рекомендаций.</div>'}</div>
-        </section>
+        ${renderAuxAnalyticsCards()}
       </div>
     `;
     setTimeout(() => renderMathInContainer(analyticsContainer), 30);
@@ -3023,7 +3021,6 @@ function renderAnalytics(gen) {
   }
   const speechGoals = speechAnalysis.structure.goals;
   if (speechExpanded) {
-    speechExpanded.speechAnalysisRetryPending = false;
     speechExpanded.speechAnalysisRetryStartedAt = 0;
   }
   const speechAnalysisHtml = `
@@ -3093,6 +3090,7 @@ function renderAnalytics(gen) {
 
       <div class="speech-analysis-footer">
         <button type="button" class="speech-export-btn" data-speech-export="true">Экспорт в Excel</button>
+        <button type="button" class="speech-export-btn" data-speech-retry="true">Попробовать снова</button>
       </div>
     </section>
   `;
