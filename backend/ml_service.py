@@ -61,7 +61,7 @@ class MLServiceClient:
     def __init__(self, api_key: str, base_url: str = "https://ml.fastclass.ru") -> None:
         self.api_key = api_key
         self.base_url = base_url.rstrip("/")
-        self._unfinished_jobs: set[str] = set()
+        self._unfinished_jobs: dict[str, str] = {}
         self._unfinished_jobs_lock = asyncio.Lock()
 
     def _headers(self, *, include_content_type: bool = True) -> dict[str, str]:
@@ -127,28 +127,38 @@ class MLServiceClient:
 
     async def _mark_job_started(self, request_name: str, job_id: str, request_preview: Any) -> None:
         async with self._unfinished_jobs_lock:
-            self._unfinished_jobs.add(job_id)
+            self._unfinished_jobs[job_id] = request_name
             unfinished_jobs = len(self._unfinished_jobs)
+            unfinished_jobs_detail = [
+                {"request": req_name, "job_id": jid}
+                for jid, req_name in sorted(self._unfinished_jobs.items(), key=lambda item: (item[1], item[0]))
+            ]
         print(
             "[ML submit]",
             {
                 "request": request_name,
                 "job_id": job_id,
                 "unfinished_jobs": unfinished_jobs,
+                "unfinished_jobs_detail": unfinished_jobs_detail,
                 "payload": request_preview,
             },
         )
 
     async def _mark_job_finished(self, request_name: str, job_id: str, response_preview: Any) -> None:
         async with self._unfinished_jobs_lock:
-            self._unfinished_jobs.discard(job_id)
+            self._unfinished_jobs.pop(job_id, None)
             unfinished_jobs = len(self._unfinished_jobs)
+            unfinished_jobs_detail = [
+                {"request": req_name, "job_id": jid}
+                for jid, req_name in sorted(self._unfinished_jobs.items(), key=lambda item: (item[1], item[0]))
+            ]
         print(
             "[ML done]",
             {
                 "request": request_name,
                 "job_id": job_id,
                 "unfinished_jobs": unfinished_jobs,
+                "unfinished_jobs_detail": unfinished_jobs_detail,
                 "response": response_preview,
             },
         )
