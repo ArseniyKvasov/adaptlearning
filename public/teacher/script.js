@@ -1436,6 +1436,7 @@ function updateTabStates(gen) {
   const hasSummary = Array.isArray(gen.summary) && gen.summary.length > 0;
   const hasQuiz = Array.isArray(gen.quiz) && gen.quiz.length > 0;
   const hasSpeechAnalysis = Boolean(getSpeechAnalysisAggregate(gen));
+  const speechRetryPending = Boolean(gen.ui && gen.ui.speechAnalysisRetryPending);
   const practice = normalizePracticeState(gen.practice || {});
   const practiceVisible = Boolean(
     gen.ui.practiceTabOpened
@@ -1449,7 +1450,7 @@ function updateTabStates(gen) {
   const processing = gen.status === 'processing';
   const summaryLoading = processing && !hasSummary;
   const quizLoading = processing && hasSummary && !hasQuiz;
-  const analyticsLoading = processing && hasQuiz && !hasSpeechAnalysis;
+  const analyticsLoading = (processing && hasQuiz && !hasSpeechAnalysis) || speechRetryPending;
 
   setTabState(summaryTabBtn, hasSummary || gen.status === 'failed', summaryLoading);
   setTabState(quizTabBtn, hasSummary || gen.status === 'failed', quizLoading);
@@ -3021,6 +3022,7 @@ function renderAnalytics(gen) {
   }
   const speechGoals = speechAnalysis.structure.goals;
   if (speechExpanded) {
+    speechExpanded.speechAnalysisRetryPending = false;
     speechExpanded.speechAnalysisRetryStartedAt = 0;
   }
   const speechAnalysisHtml = `
@@ -3420,9 +3422,8 @@ window.retryGeneration = async function retryGeneration() {
     speechState.speechAnalysisRetryPending = true;
     speechState.speechAnalysisRetryStartedAt = Date.now();
   }
-  if (!hasSummaryAndQuiz) {
-    gen.status = 'processing';
-  }
+  setActiveTab('transcript', gen, true);
+  gen.status = 'processing';
   gen.error_message = '';
   renderActiveGeneration();
   try {
