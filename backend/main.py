@@ -3179,16 +3179,6 @@ def transcript_to_summary_groups(
     )
 
 
-def transcript_to_teacher_analysis_groups(transcript_chunks: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return _build_overlapped_time_groups(
-        transcript_chunks,
-        target_seconds=SPEECH_ANALYSIS_GROUP_TARGET_SECONDS,
-        min_seconds=SPEECH_ANALYSIS_GROUP_MIN_SECONDS,
-        max_seconds=SPEECH_ANALYSIS_GROUP_MAX_SECONDS,
-        overlap_phrases=SPEECH_ANALYSIS_GROUP_OVERLAP_PHRASES,
-    )
-
-
 def log_summary_payload(summary_groups: list[dict[str, Any]], label: str) -> None:
     print(f"[summary] {label}: groups={len(summary_groups)}")
     for idx, group in enumerate(summary_groups, start=1):
@@ -3440,7 +3430,7 @@ async def build_teacher_analysis(
     ml_client: MLServiceClient,
     transcript_chunks: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    analysis_source = transcript_to_teacher_analysis_groups(transcript_chunks)
+    analysis_source = transcript_to_summary_groups(transcript_chunks)
     if not analysis_source:
         return {}
     log_summary_payload(analysis_source, "build_teacher_analysis")
@@ -3485,7 +3475,7 @@ async def run_speech_analysis_retry_pipeline(generation_id: str) -> None:
         raise RuntimeError("ML_API_KEY is empty")
     transcript = current.get("transcript", [])
     transcript_chunks = transcript_to_chunks(transcript if isinstance(transcript, list) else [])
-    analysis_source = transcript_to_teacher_analysis_groups(transcript_chunks)
+    analysis_source = transcript_to_summary_groups(transcript_chunks)
     if not analysis_source:
         raise MLServiceError(
             "Retry requested without saved transcript",
