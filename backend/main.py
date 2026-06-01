@@ -1577,6 +1577,14 @@ def build_xlsx_bytes(worksheets: list[dict[str, Any]]) -> bytes:
         cell.alignment = spec["alignment"]
         cell.border = border
 
+    def sanitize_xlsx_value(value: Any) -> Any:
+        if isinstance(value, str):
+            # openpyxl rejects control chars that can appear in transcript text or AI comments.
+            return re.sub(r"[\x00-\x08\x0B\x0C\x0E-\x1F]", "", value)
+        if isinstance(value, (int, float, bool)) or value is None:
+            return value
+        return sanitize_xlsx_value(str(value))
+
     for sheet in unique_sheets:
         ws = wb.create_sheet(title=sheet["name"])
         ws.sheet_view.showGridLines = False
@@ -1621,6 +1629,8 @@ def build_xlsx_bytes(worksheets: list[dict[str, Any]]) -> bytes:
                     value = cell
                     span = 1
                     style_id = None
+
+                value = sanitize_xlsx_value(value)
 
                 if col_num > max_cols:
                     max_cols = col_num
@@ -3715,8 +3725,16 @@ async def api_generation_retry(request: Request, background_tasks: BackgroundTas
     if not generation.get("transcript"):
         raise HTTPException(status_code=400, detail="Нет сохраненного транскрипта для повторной генерации.")
 
-    await run_ml_retry_pipeline(generation_id)
-    return {"ok": True}
+    update_generation(
+        generation_id,
+        {
+            "status": "processing",
+            "progress_percent": 100,
+            "error_message": "",
+        },
+    )
+    background_tasks.add_task(run_ml_retry_pipeline, generation_id)
+    return {"ok": True, "queued": True}
 
 
 @app.get("/api/generations/{generation_id}/speech-analysis.xlsx")

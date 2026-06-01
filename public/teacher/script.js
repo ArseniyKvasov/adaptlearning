@@ -38,6 +38,8 @@ const STATUS_LABELS = {
   completed: 'Готово',
   failed: 'Ошибка'
 };
+const SPEECH_ANALYSIS_WAIT_TIMEOUT_MS = 12 * 60 * 1000;
+const SPEECH_ANALYSIS_POLL_INTERVAL_MS = 3000;
 
 const requestedGenerationId = new URL(window.location.href).searchParams.get('generation_id') || '';
 
@@ -1368,6 +1370,7 @@ function enrichGeneration(gen) {
     practiceQuizAnswers: [],
     practiceQuizFinished: false,
     speechAnalysisRetryPending: false,
+    speechAnalysisRetryStartedAt: 0,
     speechAnalysisExpanded: {}
   };
   if (!nextUi.quizCheckStatus) nextUi.quizCheckStatus = 'idle';
@@ -1379,6 +1382,7 @@ function enrichGeneration(gen) {
   if (!Array.isArray(nextUi.practiceQuizAnswers)) nextUi.practiceQuizAnswers = [];
   if (typeof nextUi.practiceQuizFinished !== 'boolean') nextUi.practiceQuizFinished = false;
   if (typeof nextUi.speechAnalysisRetryPending !== 'boolean') nextUi.speechAnalysisRetryPending = false;
+  if (typeof nextUi.speechAnalysisRetryStartedAt !== 'number') nextUi.speechAnalysisRetryStartedAt = 0;
   if (!nextUi.speechAnalysisExpanded || typeof nextUi.speechAnalysisExpanded !== 'object') nextUi.speechAnalysisExpanded = {};
   generationUiState[gen.id] = nextUi;
   return {
@@ -1423,11 +1427,14 @@ function updateTabStates(gen) {
     || (Array.isArray(practice.quiz) && practice.quiz.length > 0)
   );
   const processing = gen.status === 'processing';
+  const summaryLoading = processing && !hasSummary;
+  const quizLoading = processing && hasSummary && !hasQuiz;
+  const analyticsLoading = processing && hasQuiz;
 
-  setTabState(summaryTabBtn, hasSummary || gen.status === 'failed', processing && hasTranscript && !hasSummary);
-  setTabState(quizTabBtn, hasQuiz || gen.status === 'failed', processing && hasSummary && !hasQuiz);
+  setTabState(summaryTabBtn, hasSummary || gen.status === 'failed', summaryLoading);
+  setTabState(quizTabBtn, hasQuiz || gen.status === 'failed', quizLoading);
   setTabState(practiceTabBtn, practiceVisible, practice.status === 'processing_summary' || practice.status === 'processing_quiz');
-  setTabState(analyticsTabBtn, hasQuiz || gen.status === 'failed', processing && hasSummary && !hasQuiz);
+  setTabState(analyticsTabBtn, (!processing && hasQuiz) || gen.status === 'failed', analyticsLoading);
 
   const activeTab = getActiveTab();
   const activeTabBtn = tabBtns && Array.from(tabBtns).find((btn) => btn.getAttribute('data-tab') === activeTab);
@@ -1505,6 +1512,44 @@ async function refreshGenerationById(generationId) {
     renderActiveGeneration();
   }
   return gen;
+}
+
+function wait(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function pollGenerationUntilSettled(generationId, { timeoutMs = SPEECH_ANALYSIS_WAIT_TIMEOUT_MS, intervalMs = SPEECH_ANALYSIS_POLL_INTERVAL_MS } = {}) {
+  if (!generationId) return null;
+  const deadline = Date.now() + timeoutMs;
+  let latest = null;
+
+  while (Date.now() < deadline) {
+    try {
+      latest = await refreshGenerationById(generationId);
+      if (!latest || latest.status !== 'processing') {
+        return latest;
+      }
+    } catch (_e) {
+      // Keep polling: the backend task may still be running.
+    }
+    await wait(intervalMs);
+  }
+
+  try {
+    latest = await refreshGenerationById(generationId);
+  } catch (_e) {
+    // ignore
+  }
+  return latest;
+}
+
+function getSpeechAnalysisWaitMs(gen) {
+  if (!gen || !gen.ui) return getGenerationAgeMs(gen);
+  const retryStartedAt = Number(gen.ui.speechAnalysisRetryStartedAt || 0);
+  if (Number.isFinite(retryStartedAt) && retryStartedAt > 0) {
+    return Math.max(0, Date.now() - retryStartedAt);
+  }
+  return getGenerationAgeMs(gen);
 }
 
 function renderTranscript(gen) {
@@ -2799,8 +2844,8 @@ function renderAnalytics(gen) {
   const transcriptLines = normalizeTranscriptLines(gen.transcript);
   const speechAnalysis = buildSpeechAnalysisViewModel(gen);
   const speechAnalysisError = getSpeechAnalysisError(gen);
-  const speechAnalysisAgeMs = getGenerationAgeMs(gen);
-  const speechAnalysisTimedOut = speechAnalysisAgeMs >= 5 * 60 * 1000;
+  const speechAnalysisWaitMs = getSpeechAnalysisWaitMs(gen);
+  const speechAnalysisTimedOut = speechAnalysisWaitMs >= SPEECH_ANALYSIS_WAIT_TIMEOUT_MS;
   const speechExpanded = getSpeechAnalysisState(gen);
   const speechRetryPending = Boolean(speechExpanded && speechExpanded.speechAnalysisRetryPending);
   const rateLimitSpeechError = /rate limit reached/i.test(speechAnalysisError);
@@ -2851,39 +2896,41 @@ function renderAnalytics(gen) {
 
   if (!speechAnalysis) {
     if (speechRetryPending) {
-      analyticsContainer.innerHTML = `
-        <div class="analytics-stack">
-          ${renderSpeechAnalysisLoadingCard(gen, {
-            retry: true,
-            retryDisabled: true,
-            message: 'Повторно запрашиваем анализ речи преподавателя...'
-          })}
+      if (!speechAnalysisTimedOut) {
+        analyticsContainer.innerHTML = `
+          <div class="analytics-stack">
+            ${renderSpeechAnalysisLoadingCard(gen, {
+              retry: true,
+              retryDisabled: true,
+              message: 'Повторно запрашиваем анализ речи преподавателя...'
+            })}
 
-          <section class="analytics-card">
-            <div class="analytics-title">Ссылка для учеников</div>
-            <div class="analytics-link-wrap">
-              <div class="analytics-link">${escapeHtml(displayLink)}</div>
-            </div>
-            <div class="analytics-link-actions">
-              <button class="analytics-btn outline" type="button" onclick="openStudentLink('${escapeHtml(link)}')">Перейти</button>
-              <button class="analytics-btn filled" type="button" onclick="handleCopyStudentLink(this, '${escapeHtml(link)}')">Скопировать</button>
-            </div>
-            <div class="analytics-meta">Завершено попыток: ${completed}</div>
-          </section>
+            <section class="analytics-card">
+              <div class="analytics-title">Ссылка для учеников</div>
+              <div class="analytics-link-wrap">
+                <div class="analytics-link">${escapeHtml(displayLink)}</div>
+              </div>
+              <div class="analytics-link-actions">
+                <button class="analytics-btn outline" type="button" onclick="openStudentLink('${escapeHtml(link)}')">Перейти</button>
+                <button class="analytics-btn filled" type="button" onclick="handleCopyStudentLink(this, '${escapeHtml(link)}')">Скопировать</button>
+              </div>
+              <div class="analytics-meta">Завершено попыток: ${completed}</div>
+            </section>
 
-          <section class="analytics-card ${completed ? '' : 'analytics-card-disabled'}">
-            <div class="analytics-title">Освоение подтем</div>
-            ${masteryHtml || '<div class="status-message">Результаты появятся после первого выполнения теста учеником.</div>'}
-          </section>
+            <section class="analytics-card ${completed ? '' : 'analytics-card-disabled'}">
+              <div class="analytics-title">Освоение подтем</div>
+              ${masteryHtml || '<div class="status-message">Результаты появятся после первого выполнения теста учеником.</div>'}
+            </section>
 
-          <section class="analytics-card ${completed ? '' : 'analytics-card-disabled'}">
-            <div class="analytics-title">Рекомендации</div>
-            <div class="analytics-reco-list">${completed ? recommendationsHtml : '<div class="analytics-reco muted">Пока нет данных для рекомендаций.</div>'}</div>
-          </section>
-        </div>
-      `;
-      setTimeout(() => renderMathInContainer(analyticsContainer), 30);
-      return;
+            <section class="analytics-card ${completed ? '' : 'analytics-card-disabled'}">
+              <div class="analytics-title">Рекомендации</div>
+              <div class="analytics-reco-list">${completed ? recommendationsHtml : '<div class="analytics-reco muted">Пока нет данных для рекомендаций.</div>'}</div>
+            </section>
+          </div>
+        `;
+        setTimeout(() => renderMathInContainer(analyticsContainer), 30);
+        return;
+      }
     }
     if (speechAnalysisError && speechExpanded) {
       speechExpanded.speechAnalysisRetryPending = false;
@@ -2894,7 +2941,7 @@ function renderAnalytics(gen) {
       : (generationFailed
         ? (gen.error_message || 'Аналитика недоступна из-за ошибки генерации.')
         : (speechAnalysisTimedOut
-        ? 'Анализ речи преподавателя не получен за 5 минут.'
+        ? 'Анализ речи преподавателя не получен за 12 минут.'
         : 'Ищем анализ речи преподавателя...'));
     analyticsContainer.innerHTML = `
       <div class="analytics-stack">
@@ -2934,6 +2981,7 @@ function renderAnalytics(gen) {
   const speechGoals = speechAnalysis.structure.goals;
   if (speechExpanded) {
     speechExpanded.speechAnalysisRetryPending = false;
+    speechExpanded.speechAnalysisRetryStartedAt = 0;
   }
   const speechAnalysisHtml = `
     <section class="analytics-card speech-analysis-card">
@@ -3329,6 +3377,7 @@ window.retryGeneration = async function retryGeneration() {
   const speechState = getSpeechAnalysisState(gen);
   if (speechState) {
     speechState.speechAnalysisRetryPending = true;
+    speechState.speechAnalysisRetryStartedAt = Date.now();
   }
   if (!hasSummaryAndQuiz) {
     gen.status = 'processing';
@@ -3341,14 +3390,16 @@ window.retryGeneration = async function retryGeneration() {
     if (!hasSummaryAndQuiz) {
       gen.status = 'processing';
     }
-    await refreshGenerationById(gen.id).catch(() => {});
+    await pollGenerationUntilSettled(gen.id);
     if (speechState) {
       speechState.speechAnalysisRetryPending = false;
+      speechState.speechAnalysisRetryStartedAt = 0;
     }
     renderActiveGeneration();
   } catch (e) {
     if (speechState) {
       speechState.speechAnalysisRetryPending = false;
+      speechState.speechAnalysisRetryStartedAt = 0;
     }
     gen.status = previousStatus;
     renderActiveGeneration();
@@ -3504,10 +3555,6 @@ function bindEvents() {
     analyticsContainer.addEventListener('toggle', (event) => {
       const accordion = event.target;
       if (!accordion || !accordion.classList || !accordion.classList.contains('speech-accordion')) return;
-      if (!accordion.open) return;
-      analyticsContainer.querySelectorAll('details.speech-accordion[open]').forEach((otherAccordion) => {
-        if (otherAccordion !== accordion) otherAccordion.open = false;
-      });
     }, true);
 
     analyticsContainer.addEventListener('click', (event) => {
