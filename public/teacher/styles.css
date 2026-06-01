@@ -354,6 +354,7 @@ body.drawer-open {
   gap: 12px;
   font-size: 0.85rem;
   word-break: break-word;
+  min-width: 0;
 }
 
 .timestamp {
@@ -368,6 +369,7 @@ body.drawer-open {
   color: #1e2a3e;
   line-height: 1.45;
   flex: 1;
+  min-width: 0;
 }
 
 .transcript-line.is-highlighted {
@@ -375,8 +377,6 @@ body.drawer-open {
   border-radius: 12px;
   padding-left: 0.65rem;
   padding-right: 0.65rem;
-  margin-left: -0.65rem;
-  margin-right: -0.65rem;
 }
 
 .transcript-highlight-mark {
@@ -389,6 +389,7 @@ body.drawer-open {
 #transcriptContainer {
   max-height: 80vh;
   overflow-y: auto;
+  overflow-x: hidden;
   padding-right: 4px;
   padding-bottom: 4rem;
 }
