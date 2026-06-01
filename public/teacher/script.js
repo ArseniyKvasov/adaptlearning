@@ -1435,6 +1435,7 @@ function updateTabStates(gen) {
   const hasTranscript = Array.isArray(gen.transcript) && gen.transcript.length > 0;
   const hasSummary = Array.isArray(gen.summary) && gen.summary.length > 0;
   const hasQuiz = Array.isArray(gen.quiz) && gen.quiz.length > 0;
+  const hasSpeechAnalysis = Boolean(getSpeechAnalysisAggregate(gen));
   const practice = normalizePracticeState(gen.practice || {});
   const practiceVisible = Boolean(
     gen.ui.practiceTabOpened
@@ -1448,12 +1449,12 @@ function updateTabStates(gen) {
   const processing = gen.status === 'processing';
   const summaryLoading = processing && !hasSummary;
   const quizLoading = processing && hasSummary && !hasQuiz;
-  const analyticsLoading = processing && hasQuiz;
+  const analyticsLoading = processing && hasQuiz && !hasSpeechAnalysis;
 
   setTabState(summaryTabBtn, hasSummary || gen.status === 'failed', summaryLoading);
-  setTabState(quizTabBtn, hasQuiz || gen.status === 'failed', quizLoading);
+  setTabState(quizTabBtn, hasSummary || gen.status === 'failed', quizLoading);
   setTabState(practiceTabBtn, practiceVisible, practice.status === 'processing_summary' || practice.status === 'processing_quiz');
-  setTabState(analyticsTabBtn, (!processing && hasQuiz) || gen.status === 'failed', analyticsLoading);
+  setTabState(analyticsTabBtn, hasQuiz || gen.status === 'failed', analyticsLoading);
 
   const activeTab = getActiveTab();
   const activeTabBtn = tabBtns && Array.from(tabBtns).find((btn) => btn.getAttribute('data-tab') === activeTab);
@@ -1599,7 +1600,7 @@ function renderTranscript(gen) {
   const progress = Math.max(0, Math.min(100, Math.round(Number(gen.progress_percent || 0))));
   const isProcessing = gen.status === 'processing';
   const loaderText = isProcessing
-    ? (progress < 100 ? 'Обрабатываем запись' : (!gen.summary.length ? 'Генерируем конспект...' : (!gen.quiz.length ? 'Генерируем тест...' : 'Завершаем обработку...')))
+    ? (progress < 100 ? 'Обрабатываем запись' : (!gen.summary.length ? 'Генерируем конспект...' : (!gen.quiz.length ? 'Генерируем тест...' : 'Генерируем аналитику...')))
     : '';
 
   if (transcriptHtml) {
@@ -2615,7 +2616,15 @@ function renderSummary(gen) {
     return;
   }
   if (!gen.summary.length) {
-    summaryContainer.innerHTML = `<div class="status-message">${gen.status === 'processing' ? 'Генерируем конспект...' : 'Конспект отсутствует'}</div>`;
+    summaryContainer.innerHTML = gen.status === 'processing'
+      ? `
+        <div class="quiz-final-loader">
+          <div class="quiz-spinner"></div>
+          <div class="quiz-final-loader-title">Генерируем конспект...</div>
+          <div class="quiz-final-loader-subtitle">Собираем итоговые разделы урока</div>
+        </div>
+      `
+      : '<div class="status-message">Конспект отсутствует</div>';
     return;
   }
 
@@ -2697,7 +2706,17 @@ function renderQuiz(gen) {
     return;
   }
   if (!gen.quiz.length) {
-    quizContainer.innerHTML = `<div class="status-message">${gen.status === 'processing' ? 'Генерируем тест...' : 'Тест отсутствует'}</div>`;
+    if (gen.status === 'processing') {
+      quizContainer.innerHTML = `
+        <div class="quiz-final-loader">
+          <div class="quiz-spinner"></div>
+          <div class="quiz-final-loader-title">Генерируем тест...</div>
+          <div class="quiz-final-loader-subtitle">${gen.summary.length ? 'Конспект уже готов, подбираем вопросы' : 'Сначала собираем конспект урока'}</div>
+        </div>
+      `;
+    } else {
+      quizContainer.innerHTML = '<div class="status-message">Тест отсутствует</div>';
+    }
     return;
   }
 
@@ -2867,6 +2886,8 @@ function renderAnalytics(gen) {
   const speechAnalysisTimedOut = speechAnalysisWaitMs >= SPEECH_ANALYSIS_WAIT_TIMEOUT_MS;
   const speechExpanded = getSpeechAnalysisState(gen);
   const speechRetryPending = Boolean(speechExpanded && speechExpanded.speechAnalysisRetryPending);
+  const hasSpeechAnalysis = Boolean(speechAnalysis);
+  const hasQuiz = Array.isArray(gen.quiz) && gen.quiz.length > 0;
   const rateLimitSpeechError = /rate limit reached/i.test(speechAnalysisError);
   const masteryHtml = mastery
     .map((item) => {
@@ -2913,7 +2934,7 @@ function renderAnalytics(gen) {
     </section>
   `;
 
-  if (!speechAnalysis) {
+  if (!hasSpeechAnalysis) {
     if (speechRetryPending) {
       if (!speechAnalysisTimedOut) {
         analyticsContainer.innerHTML = `
@@ -2962,14 +2983,17 @@ function renderAnalytics(gen) {
         : (speechAnalysisTimedOut
         ? 'Анализ речи преподавателя не получен за 12 минут.'
         : 'Ищем анализ речи преподавателя...'));
+    const shouldShowLoader = gen.status === 'processing' && hasQuiz && !speechAnalysisError && !speechAnalysisTimedOut && !generationFailed;
     analyticsContainer.innerHTML = `
       <div class="analytics-stack">
-        ${ (speechAnalysisError || generationFailed || speechAnalysisTimedOut)
+        ${ shouldShowLoader
+          ? renderSpeechAnalysisLoadingCard(gen, { retry: false, message: 'Ищем анализ речи преподавателя...' })
+          : ((speechAnalysisError || generationFailed || speechAnalysisTimedOut)
           ? renderSpeechAnalysisErrorCard(
               rateLimitSpeechError ? 'Rate limit reached' : errorMessage,
               { retry: shouldRetry, retryDisabled: false }
             )
-          : renderSpeechAnalysisLoadingCard(gen, { retry: false, message: 'Ищем анализ речи преподавателя...' })}
+          : renderSpeechAnalysisLoadingCard(gen, { retry: false, message: 'Ищем анализ речи преподавателя...' }))}
 
         <section class="analytics-card">
           <div class="analytics-title">Ссылка для учеников</div>

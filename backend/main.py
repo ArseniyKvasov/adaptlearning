@@ -3407,6 +3407,7 @@ async def transcribe_audio_chunks(
 async def build_summary_and_quiz(
     ml_client: MLServiceClient,
     transcript_chunks: list[dict[str, Any]],
+    generation_id: Optional[str] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     summary_source = transcript_chunk_payloads(transcript_chunks)
     summary_groups = transcript_to_summary_groups(summary_source)
@@ -3414,7 +3415,33 @@ async def build_summary_and_quiz(
     mini_summaries = await asyncio.gather(*(ml_client.make_mini_summary(chunk) for chunk in summary_groups))
     summary = await ml_client.make_lesson_summary(list(mini_summaries))
     log_final_summary(summary, "build_summary_and_quiz")
+    if generation_id:
+        update_generation(
+            generation_id,
+            {
+                "status": "processing",
+                "progress_percent": 100,
+                "mini_summary": list(mini_summaries),
+                "summary": summary,
+                "quiz": [],
+                "analytics": {},
+                "error_message": "",
+            },
+        )
     quiz = shuffle_quiz_options(await ml_client.make_quiz(summary))
+    if generation_id:
+        update_generation(
+            generation_id,
+            {
+                "status": "processing",
+                "progress_percent": 100,
+                "mini_summary": list(mini_summaries),
+                "summary": summary,
+                "quiz": quiz,
+                "analytics": {},
+                "error_message": "",
+            },
+        )
     transcript: list[dict[str, Any]] = []
     for chunk in transcript_chunks:
         if not isinstance(chunk, dict):
@@ -3430,8 +3457,9 @@ async def build_teacher_analysis(
     ml_client: MLServiceClient,
     transcript_chunks: list[dict[str, Any]],
 ) -> dict[str, Any]:
-    analysis_source = transcript_to_summary_groups(transcript_chunks)
+    analysis_source = transcript_to_summary_groups(transcript_chunk_payloads(transcript_chunks))
     if not analysis_source:
+        print("Teacher analysis skipped: no usable transcript chunks")
         return {}
     log_summary_payload(analysis_source, "build_teacher_analysis")
     analysis_tasks = [asyncio.create_task(ml_client.make_teacher_analysis(chunk)) for chunk in analysis_source]
@@ -3468,8 +3496,9 @@ async def build_teacher_analysis(
 async def build_summary_quiz_and_speech_analysis(
     ml_client: MLServiceClient,
     transcript_chunks: list[dict[str, Any]],
+    generation_id: Optional[str] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], str]:
-    summary_task = asyncio.create_task(build_summary_and_quiz(ml_client, transcript_chunks))
+    summary_task = asyncio.create_task(build_summary_and_quiz(ml_client, transcript_chunks, generation_id=generation_id))
     speech_task = asyncio.create_task(build_teacher_analysis(ml_client, transcript_chunks))
     print("[speech] build_summary_quiz_and_speech_analysis: started")
     try:
@@ -3563,7 +3592,11 @@ async def run_ml_retry_pipeline(generation_id: str) -> None:
 
         update_generation(generation_id, {"status": "processing", "progress_percent": 100, "error_message": ""})
         log_summary_payload(summary_groups, "run_ml_retry_pipeline")
-        transcript, mini_summaries, summary, quiz, speech_analysis, speech_error = await build_summary_quiz_and_speech_analysis(ml_client, transcript_chunks)
+        transcript, mini_summaries, summary, quiz, speech_analysis, speech_error = await build_summary_quiz_and_speech_analysis(
+            ml_client,
+            transcript_chunks,
+            generation_id=generation_id,
+        )
         log_final_summary(summary, "run_ml_retry_pipeline")
         analytics = build_analytics(generation_id, quiz, speech_analysis, speech_error)
         update_generation(
@@ -3608,7 +3641,11 @@ async def finalize_generation_from_transcript(generation_id: str, transcript: li
             raise MLServiceError("Cached transcript is empty", "Не удалось получить транскрипт из файла. Попробуйте другой файл.")
 
         log_summary_payload(summary_groups, "finalize_generation_from_transcript")
-        transcript, mini_summaries, summary, quiz, speech_analysis, speech_error = await build_summary_quiz_and_speech_analysis(ml_client, transcript_chunks)
+        transcript, mini_summaries, summary, quiz, speech_analysis, speech_error = await build_summary_quiz_and_speech_analysis(
+            ml_client,
+            transcript_chunks,
+            generation_id=generation_id,
+        )
         log_final_summary(summary, "finalize_generation_from_transcript")
         analytics = build_analytics(generation_id, quiz, speech_analysis, speech_error)
 
@@ -3654,7 +3691,11 @@ async def run_generation_pipeline(generation_id: str, file_bytes: bytes, file_na
         if content_hash:
             store_cached_transcript(content_hash, transcript_from_transcription_results(transcription_results))
 
-        transcript, mini_summaries, summary, quiz, speech_analysis, speech_error = await build_summary_quiz_and_speech_analysis(ml_client, transcription_results)
+        transcript, mini_summaries, summary, quiz, speech_analysis, speech_error = await build_summary_quiz_and_speech_analysis(
+            ml_client,
+            transcription_results,
+            generation_id=generation_id,
+        )
         analytics = build_analytics(generation_id, quiz, speech_analysis, speech_error)
 
         update_generation(

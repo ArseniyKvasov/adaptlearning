@@ -1346,6 +1346,12 @@ body.drawer-open {
   word-break: break-word;
 }
 
+.speech-fragment-more {
+  font-size: 0.8rem;
+  line-height: 1.6;
+  color: #475569;
+}
+
 .speech-fragment-line {
   min-width: 0;
 }
@@ -1417,7 +1423,8 @@ body.drawer-open {
   color: #1d4ed8;
   border-radius: 999px;
   padding: 0.42rem 0.8rem;
-  font-size: 0.78rem;
+  font-size: inherit;
+  line-height: inherit;
   font-weight: 600;
   cursor: pointer;
   transition: background 0.15s ease, border-color 0.15s ease, transform 0.15s ease, box-shadow 0.15s ease;
@@ -1448,6 +1455,8 @@ body.drawer-open {
   flex-direction: column;
   gap: 0.4rem;
   margin-top: 0.4rem;
+  font-size: inherit;
+  line-height: inherit;
 }
 
 .speech-check-row {
