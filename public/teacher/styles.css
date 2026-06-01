@@ -348,7 +348,7 @@ body.drawer-open {
 }
 
 .transcript-line {
-  padding: 0.7rem 0;
+  padding: 0.45rem 0.6rem;
   border-bottom: 1px solid #f0f2f5;
   display: flex;
   gap: 12px;
@@ -374,9 +374,6 @@ body.drawer-open {
 
 .transcript-line.is-highlighted {
   background: #fff8cc;
-  border-radius: 12px;
-  padding-left: 0.65rem;
-  padding-right: 0.65rem;
 }
 
 .transcript-highlight-mark {
