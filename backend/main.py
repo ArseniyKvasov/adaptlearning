@@ -3435,11 +3435,34 @@ async def build_teacher_analysis(
         return {}
     log_summary_payload(analysis_source, "build_teacher_analysis")
     analysis_tasks = [asyncio.create_task(ml_client.make_teacher_analysis(chunk)) for chunk in analysis_source]
-    chunk_analyses = await asyncio.gather(*analysis_tasks)
-    aggregate = await ml_client.make_teacher_analysis_aggregate(list(chunk_analyses))
-    if isinstance(aggregate, dict):
-        aggregate["chunk_analyses"] = list(chunk_analyses)
-    return aggregate if isinstance(aggregate, dict) else {}
+    raw_results = await asyncio.gather(*analysis_tasks, return_exceptions=True)
+
+    chunk_analyses: list[dict[str, Any]] = []
+    failed_chunks = 0
+    for result in raw_results:
+        if isinstance(result, Exception):
+            failed_chunks += 1
+            print("Teacher analysis chunk failed:", result)
+            continue
+        if isinstance(result, dict) and result:
+            chunk_analyses.append(result)
+
+    if not chunk_analyses:
+        print("Teacher analysis produced no usable chunk analyses")
+        return {}
+
+    try:
+        aggregate = await ml_client.make_teacher_analysis_aggregate(list(chunk_analyses))
+    except Exception as exc:
+        print("Teacher analysis aggregate failed:", exc)
+        aggregate = {}
+
+    if not isinstance(aggregate, dict):
+        aggregate = {}
+    aggregate["chunk_analyses"] = list(chunk_analyses)
+    if failed_chunks:
+        aggregate["chunk_failures"] = failed_chunks
+    return aggregate
 
 
 async def build_summary_quiz_and_speech_analysis(
@@ -3448,6 +3471,7 @@ async def build_summary_quiz_and_speech_analysis(
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], str]:
     summary_task = asyncio.create_task(build_summary_and_quiz(ml_client, transcript_chunks))
     speech_task = asyncio.create_task(build_teacher_analysis(ml_client, transcript_chunks))
+    print("[speech] build_summary_quiz_and_speech_analysis: started")
     try:
         transcript, mini_summaries, summary, quiz = await summary_task
     except Exception:
@@ -3459,6 +3483,7 @@ async def build_summary_quiz_and_speech_analysis(
     speech_error = ""
     try:
         speech_analysis = await speech_task
+        print("[speech] build_summary_quiz_and_speech_analysis: finished", {"has_analysis": bool(speech_analysis)})
     except Exception as exc:
         print("Teacher analysis failed:", exc)
         speech_analysis = {}

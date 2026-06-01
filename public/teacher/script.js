@@ -305,7 +305,7 @@ function formatSpeechFragmentType(type) {
 
 function formatSpeechFragmentTypeTitle(type) {
   const value = formatSpeechFragmentType(type);
-  if (!value) return 'Пример';
+  if (!value) return '';
   return value.charAt(0).toUpperCase() + value.slice(1);
 }
 
