@@ -579,6 +579,15 @@ function getSpeechAnalysisState(gen) {
   return gen.ui.speechAnalysisExpanded;
 }
 
+function getSpeechAnalysisFragmentState(gen) {
+  if (!gen) return null;
+  if (!gen.ui) gen.ui = {};
+  if (!gen.ui.speechAnalysisFragmentExpanded || typeof gen.ui.speechAnalysisFragmentExpanded !== 'object') {
+    gen.ui.speechAnalysisFragmentExpanded = {};
+  }
+  return gen.ui.speechAnalysisFragmentExpanded;
+}
+
 function buildSpeechAnalysisPrototype(gen) {
   const transcriptLines = normalizeTranscriptLines(gen && gen.transcript ? gen.transcript : []);
   const questionSnippets = [
@@ -713,16 +722,49 @@ function renderSpeechFragment(fragment, gen, sectionKey, index, transcriptLines 
 
 function renderSpeechFragmentList(fragments, gen, sectionKey, expanded = false, transcriptLines = []) {
   const items = Array.isArray(fragments) ? fragments : [];
-  const listHtml = items
+  const fragmentState = getSpeechAnalysisFragmentState(gen);
+  const isExpanded = Boolean(expanded || (fragmentState && fragmentState[sectionKey]));
+  const visibleItems = isExpanded ? items : items.slice(0, 10);
+  const hiddenCount = Math.max(0, items.length - visibleItems.length);
+  const listHtml = visibleItems
     .map((fragment, index) => renderSpeechFragment(fragment, gen, sectionKey, index, transcriptLines))
     .filter(Boolean)
-    .map((fragmentHtml) => `<div class="speech-fragment-line">${fragmentHtml}</div>`)
+    .map((fragmentHtml, index) => `<div class="speech-fragment-line" data-speech-section="${escapeHtml(sectionKey)}" data-speech-index="${index}">${fragmentHtml}</div>`)
     .join('');
+  const moreButtonHtml = hiddenCount > 0
+    ? `
+      <button
+        type="button"
+        class="speech-fragment-more-btn"
+        data-speech-fragment-more="true"
+        data-speech-section="${escapeHtml(sectionKey)}"
+      >Показать еще (${hiddenCount})</button>
+    `
+    : '';
   return `
     <div class="speech-fragment-list-wrap">
       <div class="speech-fragment-list">${listHtml}</div>
+      ${moreButtonHtml}
     </div>
   `;
+}
+
+function revealSpeechFragmentsSection(sectionKey) {
+  const gen = getActiveGeneration();
+  if (!gen) return;
+  const speechFragmentState = getSpeechAnalysisFragmentState(gen);
+  if (!speechFragmentState) return;
+  speechFragmentState[sectionKey] = true;
+  renderActiveGeneration();
+  window.requestAnimationFrame(() => {
+    window.requestAnimationFrame(() => {
+      const safeSectionKey = typeof CSS !== 'undefined' && CSS.escape ? CSS.escape(sectionKey) : sectionKey;
+      const target = analyticsContainer && analyticsContainer.querySelector(`[data-speech-section="${safeSectionKey}"][data-speech-index="10"]`);
+      if (target && typeof target.scrollIntoView === 'function') {
+        target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    });
+  });
 }
 
 function renderSpeechCheck(title, value) {
@@ -1371,6 +1413,7 @@ function enrichGeneration(gen) {
     practiceQuizFinished: false,
     speechAnalysisRetryPending: false,
     speechAnalysisRetryStartedAt: 0,
+    speechAnalysisFragmentExpanded: {},
     speechAnalysisExpanded: {}
   };
   if (!nextUi.quizCheckStatus) nextUi.quizCheckStatus = 'idle';
@@ -1383,6 +1426,7 @@ function enrichGeneration(gen) {
   if (typeof nextUi.practiceQuizFinished !== 'boolean') nextUi.practiceQuizFinished = false;
   if (typeof nextUi.speechAnalysisRetryPending !== 'boolean') nextUi.speechAnalysisRetryPending = false;
   if (typeof nextUi.speechAnalysisRetryStartedAt !== 'number') nextUi.speechAnalysisRetryStartedAt = 0;
+  if (!nextUi.speechAnalysisFragmentExpanded || typeof nextUi.speechAnalysisFragmentExpanded !== 'object') nextUi.speechAnalysisFragmentExpanded = {};
   if (!nextUi.speechAnalysisExpanded || typeof nextUi.speechAnalysisExpanded !== 'object') nextUi.speechAnalysisExpanded = {};
   generationUiState[gen.id] = nextUi;
   return {
@@ -3561,6 +3605,15 @@ function bindEvents() {
       const retryBtn = event.target.closest('[data-speech-retry="true"]');
       if (retryBtn) {
         retryGeneration();
+        return;
+      }
+
+      const moreBtn = event.target.closest('[data-speech-fragment-more="true"]');
+      if (moreBtn) {
+        const sectionKey = moreBtn.getAttribute('data-speech-section') || '';
+        if (sectionKey) {
+          revealSpeechFragmentsSection(sectionKey);
+        }
         return;
       }
 
