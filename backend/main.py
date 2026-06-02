@@ -3467,11 +3467,52 @@ async def build_summary_and_quiz(
     ml_client: MLServiceClient,
     transcript_chunks: list[dict[str, Any]],
     generation_id: Optional[str] = None,
+    *,
+    chunk_analyses: list[dict[str, Any]] | None = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     summary_source = transcript_chunk_payloads(transcript_chunks)
     summary_groups = transcript_to_summary_groups(summary_source)
     log_summary_payload(summary_groups, "build_summary_and_quiz")
-    mini_summaries = await asyncio.gather(*(ml_client.make_mini_summary(chunk) for chunk in summary_groups))
+    if chunk_analyses is None:
+        analysis_tasks = [asyncio.create_task(ml_client.make_chunk_analyze(chunk)) for chunk in summary_groups]
+        raw_results = await asyncio.gather(*analysis_tasks, return_exceptions=True)
+        chunk_analyses = []
+        failed_chunks = 0
+        for result in raw_results:
+            if isinstance(result, Exception):
+                failed_chunks += 1
+                print("Chunk analysis failed:", result)
+                continue
+            if isinstance(result, dict) and result:
+                chunk_analyses.append(result)
+        if failed_chunks:
+            print("Chunk analysis completed with failures:", {"failed_chunks": failed_chunks, "total": len(summary_groups)})
+    else:
+        chunk_analyses = [chunk for chunk in chunk_analyses if isinstance(chunk, dict) and chunk]
+
+    mini_summaries = []
+    for chunk in chunk_analyses:
+        key_points_raw = chunk.get("key_points")
+        if not isinstance(key_points_raw, list):
+            continue
+        key_points = [str(point).strip() for point in key_points_raw if str(point).strip()]
+        if not key_points:
+            continue
+        mini_summaries.append(
+            {
+                "chunk_id": chunk.get("chunk_id"),
+                "start_time": chunk.get("start_time"),
+                "end_time": chunk.get("end_time"),
+                "key_points": key_points,
+                "terms": [],
+                "examples": [],
+            }
+        )
+    if not mini_summaries:
+        raise MLServiceError(
+            "Chunk analysis produced no usable mini summaries",
+            "Сервис не вернул полезный результат по чанкам. Попробуйте повторить генерацию.",
+        )
     summary = await ml_client.make_lesson_summary(list(mini_summaries))
     log_final_summary(summary, "build_summary_and_quiz")
     if generation_id:
@@ -3515,24 +3556,30 @@ async def build_summary_and_quiz(
 async def build_teacher_analysis(
     ml_client: MLServiceClient,
     transcript_chunks: list[dict[str, Any]],
+    *,
+    chunk_analyses: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     analysis_source = transcript_to_summary_groups(transcript_chunk_payloads(transcript_chunks))
     if not analysis_source:
         print("Teacher analysis skipped: no usable transcript chunks")
         return {}
     log_summary_payload(analysis_source, "build_teacher_analysis")
-    analysis_tasks = [asyncio.create_task(ml_client.make_teacher_analysis(chunk)) for chunk in analysis_source]
-    raw_results = await asyncio.gather(*analysis_tasks, return_exceptions=True)
+    if chunk_analyses is None:
+        analysis_tasks = [asyncio.create_task(ml_client.make_chunk_analyze(chunk)) for chunk in analysis_source]
+        raw_results = await asyncio.gather(*analysis_tasks, return_exceptions=True)
 
-    chunk_analyses: list[dict[str, Any]] = []
-    failed_chunks = 0
-    for result in raw_results:
-        if isinstance(result, Exception):
-            failed_chunks += 1
-            print("Teacher analysis chunk failed:", result)
-            continue
-        if isinstance(result, dict) and result:
-            chunk_analyses.append(result)
+        chunk_analyses = []
+        failed_chunks = 0
+        for result in raw_results:
+            if isinstance(result, Exception):
+                failed_chunks += 1
+                print("Teacher analysis chunk failed:", result)
+                continue
+            if isinstance(result, dict) and result:
+                chunk_analyses.append(result)
+    else:
+        chunk_analyses = [chunk for chunk in chunk_analyses if isinstance(chunk, dict) and chunk]
+        failed_chunks = 0
 
     if not chunk_analyses:
         print("Teacher analysis produced no usable chunk analyses")
@@ -3560,8 +3607,38 @@ async def build_summary_quiz_and_speech_analysis(
     transcript_chunks: list[dict[str, Any]],
     generation_id: Optional[str] = None,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], str]:
-    summary_task = asyncio.create_task(build_summary_and_quiz(ml_client, transcript_chunks, generation_id=generation_id))
-    speech_task = asyncio.create_task(build_teacher_analysis(ml_client, transcript_chunks))
+    summary_source = transcript_chunk_payloads(transcript_chunks)
+    summary_groups = transcript_to_summary_groups(summary_source)
+    chunk_analysis_tasks = [asyncio.create_task(ml_client.make_chunk_analyze(chunk)) for chunk in summary_groups]
+    chunk_analysis_results = await asyncio.gather(*chunk_analysis_tasks, return_exceptions=True)
+
+    chunk_analyses: list[dict[str, Any]] = []
+    failed_chunks = 0
+    for result in chunk_analysis_results:
+        if isinstance(result, Exception):
+            failed_chunks += 1
+            print("Chunk analysis failed:", result)
+            continue
+        if isinstance(result, dict) and result:
+            chunk_analyses.append(result)
+    if failed_chunks:
+        print("Chunk analysis completed with failures:", {"failed_chunks": failed_chunks, "total": len(summary_groups)})
+
+    summary_task = asyncio.create_task(
+        build_summary_and_quiz(
+            ml_client,
+            transcript_chunks,
+            generation_id=generation_id,
+            chunk_analyses=list(chunk_analyses),
+        )
+    )
+    speech_task = asyncio.create_task(
+        build_teacher_analysis(
+            ml_client,
+            transcript_chunks,
+            chunk_analyses=list(chunk_analyses),
+        )
+    )
     print("[speech] build_summary_quiz_and_speech_analysis: started")
     try:
         transcript, mini_summaries, summary, quiz = await summary_task

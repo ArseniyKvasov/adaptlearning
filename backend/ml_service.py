@@ -407,29 +407,11 @@ class MLServiceClient:
                 await self._mark_job_finished("/transcribe-chunk", job_id, self._compact_preview(self._task_result(task)))
 
     async def _make_mini_summary_once(self, chunk_transcript: dict[str, Any]) -> dict[str, Any]:
-        task: dict[str, Any] = {}
-        task = await self._submit_task("/mini-summary", chunk_transcript, timeout_s=120)
-        try:
-            task = await self._wait_for_task(task, timeout_s=3600)
-            data = self._task_result(task)
-            key_points_raw = data.get("key_points")
-            key_points: list[str] = []
-            if isinstance(key_points_raw, list):
-                key_points = [_fix_json_escapes(str(item).strip()) for item in key_points_raw if str(item).strip()]
-            if not key_points:
-                raise MLServiceError("Mini-summary response has no key_points", "Сервис вернул пустой мини-конспект. Попробуйте повторить генерацию.")
-            return {
-                "chunk_id": chunk_transcript.get("chunk_id"),
-                "start_time": chunk_transcript.get("start_time"),
-                "end_time": chunk_transcript.get("end_time"),
-                "key_points": key_points,
-                "terms": data.get("terms") if isinstance(data.get("terms"), list) else [],
-                "examples": data.get("examples") if isinstance(data.get("examples"), list) else [],
-            }
-        finally:
-            job_id = str(task.get("job_id") or "").strip()
-            if job_id:
-                await self._mark_job_finished("/mini-summary", job_id, self._compact_preview(self._task_result(task)))
+        chunk_analysis = await self._make_chunk_analysis_once(chunk_transcript)
+        mini_summary = self._mini_summary_from_chunk_analysis(chunk_analysis)
+        if not mini_summary:
+            raise MLServiceError("Mini-summary response has no key_points", "Сервис вернул пустой мини-конспект. Попробуйте повторить генерацию.")
+        return mini_summary
 
     async def make_mini_summary(self, chunk_transcript: dict[str, Any]) -> dict[str, Any]:
         return await self._make_mini_summary_once(chunk_transcript)
@@ -484,16 +466,22 @@ class MLServiceClient:
         return localized
 
     @staticmethod
-    def _normalize_teacher_analysis_chunk(item: Any) -> dict[str, Any]:
+    def _normalize_chunk_analysis_chunk(item: Any) -> dict[str, Any]:
         if not isinstance(item, dict):
             return {}
 
         def normalize_list(value: Any) -> list[dict[str, Any]]:
-            return [
-                MLServiceClient._normalize_teacher_analysis_fragment(fragment)
-                for fragment in value
-                if isinstance(value, list) and isinstance(fragment, dict) and str(fragment.get("text") or "").strip()
-            ] if isinstance(value, list) else []
+            if not isinstance(value, list):
+                return []
+            normalized: list[dict[str, Any]] = []
+            for fragment in value:
+                if not isinstance(fragment, dict):
+                    continue
+                text = str(fragment.get("text") or "").strip()
+                if not text:
+                    continue
+                normalized.append(MLServiceClient._normalize_teacher_analysis_fragment(fragment))
+            return normalized
 
         lesson_events: list[dict[str, Any]] = []
         raw_events = item.get("lesson_events")
@@ -531,12 +519,18 @@ class MLServiceClient:
                 "comment": _fix_json_escapes(str(goal.get("comment") or "").strip()),
             }
 
+        key_points_raw = item.get("key_points")
+        key_points: list[str] = []
+        if isinstance(key_points_raw, list):
+            key_points = [_fix_json_escapes(str(point).strip()) for point in key_points_raw if str(point).strip()]
+
         flags = item.get("flags") if isinstance(item.get("flags"), dict) else {}
 
         return {
             "chunk_id": int(item.get("chunk_id", 0) or 0),
             "start_time": str(item.get("start_time") or "").strip(),
             "end_time": str(item.get("end_time") or "").strip(),
+            "key_points": key_points,
             "teacher_questions": normalize_list(item.get("teacher_questions")),
             "student_answers": normalize_list(item.get("student_answers")),
             "examples_and_analogies": normalize_list(item.get("examples_and_analogies")),
@@ -549,25 +543,49 @@ class MLServiceClient:
                 "profanity": normalize_list(flags.get("profanity")),
                 "overly_familiar_tone": normalize_list(flags.get("overly_familiar_tone")),
             },
+            "terms": [],
+            "examples": [],
         }
 
-    async def _make_teacher_analysis_once(self, chunk_transcript: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _mini_summary_from_chunk_analysis(chunk_analysis: dict[str, Any]) -> dict[str, Any]:
+        if not isinstance(chunk_analysis, dict):
+            return {}
+        key_points_raw = chunk_analysis.get("key_points")
+        key_points: list[str] = []
+        if isinstance(key_points_raw, list):
+            key_points = [_fix_json_escapes(str(item).strip()) for item in key_points_raw if str(item).strip()]
+        if not key_points:
+            return {}
+        return {
+            "chunk_id": chunk_analysis.get("chunk_id"),
+            "start_time": chunk_analysis.get("start_time"),
+            "end_time": chunk_analysis.get("end_time"),
+            "key_points": key_points,
+            "terms": [],
+            "examples": [],
+        }
+
+    async def _make_chunk_analysis_once(self, chunk_transcript: dict[str, Any]) -> dict[str, Any]:
         task: dict[str, Any] = {}
-        task = await self._submit_task("/teacher-analysis", chunk_transcript, timeout_s=180)
+        task = await self._submit_task("/chunk-analyze", chunk_transcript, timeout_s=180)
         try:
             task = await self._wait_for_task(task, timeout_s=3600)
             data = self._task_result(task)
-            normalized = self._normalize_teacher_analysis_chunk(data)
-            if not normalized:
-                raise MLServiceError("Teacher analysis response is empty", "Сервис вернул пустой анализ речи преподавателя. Попробуйте повторить генерацию.")
+            normalized = self._normalize_chunk_analysis_chunk(data)
+            if not normalized or not normalized.get("key_points"):
+                raise MLServiceError("Chunk analysis response is empty", "Сервис вернул пустой анализ чанка. Попробуйте повторить генерацию.")
             return normalized
         finally:
             job_id = str(task.get("job_id") or "").strip()
             if job_id:
-                await self._mark_job_finished("/teacher-analysis", job_id, self._compact_preview(self._task_result(task)))
+                await self._mark_job_finished("/chunk-analyze", job_id, self._compact_preview(self._task_result(task)))
+
+    async def make_chunk_analyze(self, chunk_transcript: dict[str, Any]) -> dict[str, Any]:
+        return await self._make_chunk_analysis_once(chunk_transcript)
 
     async def make_teacher_analysis(self, chunk_transcript: dict[str, Any]) -> dict[str, Any]:
-        return await self._make_teacher_analysis_once(chunk_transcript)
+        return await self._make_chunk_analysis_once(chunk_transcript)
 
     async def _make_teacher_analysis_aggregate_once(self, chunk_analyses: list[dict[str, Any]]) -> dict[str, Any]:
         payload = {

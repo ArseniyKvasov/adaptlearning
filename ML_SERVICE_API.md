@@ -73,8 +73,50 @@ Response:
 
 ---
 
+### `POST /chunk-analyze`
+Постановка задачи на объединённый анализ одного чанка.
+
+Request: `application/json`
+
+```json
+{
+  "chunk_id": 1,
+  "start_time": "00:00",
+  "end_time": "00:15",
+  "transcript": [
+    {
+      "start_ms": 0,
+      "text": "..."
+    }
+  ]
+}
+```
+
+Поля:
+- `chunk_id` integer, required
+- `start_time` string, required
+- `end_time` string, required
+- `transcript` array, required
+- каждый элемент `transcript`:
+  - `start_ms` integer, required
+  - `text` string, required
+
+Response:
+```json
+{
+  "job_id": "a1b2c3...",
+  "task_type": "chunk-analyze",
+  "status": "queued"
+}
+```
+
+---
+
 ### `POST /mini-summary`
-Постановка задачи на мини-конспект.
+Совместимый endpoint для старых клиентов.
+
+Новый основной контракт для чанков находится в `POST /chunk-analyze`.
+`POST /mini-summary` может сохраняться для обратной совместимости, но новый код должен использовать общий анализ чанка.
 
 Request: `application/json`
 
@@ -110,6 +152,39 @@ Response:
 {
   "job_id": "a1b2c3...",
   "task_type": "mini-summary",
+  "status": "queued"
+}
+```
+
+---
+
+### `POST /teacher-analysis`
+Совместимый endpoint для старых клиентов.
+
+Новый основной контракт для чанков находится в `POST /chunk-analyze`.
+`POST /teacher-analysis` может сохраняться для обратной совместимости, но новый код должен использовать общий анализ чанка.
+
+Request: `application/json`
+
+```json
+{
+  "chunk_id": 1,
+  "start_time": "00:00",
+  "end_time": "00:15",
+  "transcript": [
+    {
+      "start_ms": 0,
+      "text": "..."
+    }
+  ]
+}
+```
+
+Response:
+```json
+{
+  "job_id": "a1b2c3...",
+  "task_type": "teacher-analysis",
   "status": "queued"
 }
 ```
@@ -319,12 +394,14 @@ Response:
 - `succeeded`
 - `failed`
 
+Для `chunk-analyze` в `result` должны возвращаться `chunk_id`, `start_time`, `end_time`, `key_points`, `teacher_questions`, `student_answers`, `examples_and_analogies`, `lesson_events`, `goals_and_summary` и `flags`.
+
 ## Рекомендуемый поток использования
 
 1. Основное приложение режет исходный файл на чанки.
 2. Для каждого чанка вызывает `POST /transcribe-chunk` и затем опрашивает `GET /tasks/{job_id}` до `succeeded`.
-3. Для каждой группы транскрипта вызывает `POST /mini-summary` и затем опрашивает `GET /tasks/{job_id}`.
-4. После сбора всех mini-summary вызывает `POST /lesson-summary` и опрашивает задачу до готовности.
+3. Для каждой группы транскрипта вызывает `POST /chunk-analyze` и затем опрашивает `GET /tasks/{job_id}`.
+4. Из `key_points` всех chunk-analyze ответов собирает `POST /lesson-summary` и опрашивает задачу до готовности.
 5. Затем вызывает `POST /quiz` и опрашивает задачу до готовности.
 6. Если после теста нужны адаптивные упражнения, вызывает `POST /practice-summary` и опрашивает задачу до готовности.
 7. При проверке открытых ответов вызывает `POST /grade-open-answers` и опрашивает задачу до готовности.
