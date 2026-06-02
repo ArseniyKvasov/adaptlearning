@@ -345,6 +345,13 @@ function getSpeechAnalysisAggregate(gen) {
   return speech;
 }
 
+function isAggregatedSpeechAnalysis(gen) {
+  const speech = getSpeechAnalysisAggregate(gen);
+  if (!speech) return false;
+  const chunkAnalyses = Array.isArray(speech.chunk_analyses) ? speech.chunk_analyses : [];
+  return chunkAnalyses.length > 1 || Number(speech.chunk_failures || 0) > 0;
+}
+
 function getSpeechAnalysisError(gen) {
   const analytics = gen && gen.analytics && typeof gen.analytics === 'object' ? gen.analytics : null;
   if (!analytics) return '';
@@ -2895,6 +2902,7 @@ function renderAnalytics(gen) {
   const speechRetryPending = Boolean(speechExpanded && speechExpanded.speechAnalysisRetryPending);
   const hasSpeechAnalysis = Boolean(speechAnalysis);
   const hasQuiz = Array.isArray(gen.quiz) && gen.quiz.length > 0;
+  const showSpeechRetryButton = Boolean(speechAnalysisError || generationFailed || speechAnalysisTimedOut || isAggregatedSpeechAnalysis(gen));
   const rateLimitSpeechError = /rate limit reached/i.test(speechAnalysisError);
   const masteryHtml = mastery
     .map((item) => {
@@ -3094,7 +3102,7 @@ function renderAnalytics(gen) {
 
       <div class="speech-analysis-footer">
         <button type="button" class="speech-export-btn" data-speech-export="true">Экспорт в Excel</button>
-        <button type="button" class="speech-export-btn" data-speech-retry="true">Попробовать снова</button>
+        ${showSpeechRetryButton ? '<button type="button" class="speech-export-btn" data-speech-retry="true">Попробовать снова</button>' : ''}
       </div>
     </section>
   `;
