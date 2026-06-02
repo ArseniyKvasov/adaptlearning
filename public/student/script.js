@@ -49,7 +49,8 @@ function restoreMathSegments(text, mathParts) {
 
 function normalizeTextBreaks(text) {
   return (text || '')
-    .replace(/\\n/g, '\n');
+    .replace(/\\n/g, '\n')
+    .replace(/\u2014/g, '-');
 }
 
 function removePunctuationAfterBlockMath(text) {
@@ -61,7 +62,8 @@ function removePunctuationAfterBlockMath(text) {
 
 function normalizeQuizText(text) {
   return (text || '')
-    .replace(/\\n/g, '\n');
+    .replace(/\\n/g, '\n')
+    .replace(/\u2014/g, '-');
 }
 
 function normalizePracticeState(raw) {
@@ -321,6 +323,10 @@ function markdownInlineToHtml(text) {
   return restoreMathSegments(html, protectedMath.mathParts);
 }
 
+function stripListMarker(text) {
+  return String(text || '').replace(/^\s*[\*\-]\s+/, '').trim();
+}
+
 function markdownInlineToHtmlQuiz(text) {
   let html = escapeHtml(normalizeQuizText(text));
   const protectedMath = protectMathSegments(html);
@@ -416,7 +422,7 @@ function formatMarkdownToHtml(text) {
       if (isListLine(current)) {
         const listItems = [];
         while (i < lines.length && isListLine(lines[i])) {
-          listItems.push(`<li>${renderInline(lines[i].replace(/^[\*\-\u2013\u2014]\s+/, '').trim())}</li>`);
+          listItems.push(`<li>${renderInline(stripListMarker(lines[i]))}</li>`);
           i += 1;
         }
         parts.push(`<ul>${listItems.join('')}</ul>`);
@@ -849,29 +855,20 @@ function renderSummary() {
     return;
   }
 
-  const tocHtml = `
-    <div class="summary-toc">
-      <h4>Оглавление</h4>
-      <ul class="toc-list">
-        ${summaryData.map((s, idx) => `<li class="toc-item" data-section-id="summary-section-${idx}" data-subtopic="${escapeHtml(s.subtopic || '')}">${escapeHtml(s.subtopic || `Раздел ${idx + 1}`)}</li>`).join('')}
-      </ul>
-    </div>
-  `;
-  const contentHtml = `
-    <div class="summary-content">
-      ${summaryData.map((s, idx) => `
-        <section id="summary-section-${idx}" class="summary-section">
-          <h3>${escapeHtml(s.subtopic || `Раздел ${idx + 1}`)}</h3>
-          <div class="content">${formatMarkdownToHtml(s.content || '')}</div>
-        </section>
-      `).join('')}
-    </div>
-  `;
+  let tocHtml = '<div class="summary-toc"><h4>Оглавление</h4><ul class="toc-list">';
+  let contentHtml = '<div class="summary-content">';
+  for (let idx = 0; idx < summaryData.length; idx++) {
+    const section = summaryData[idx];
+    const id = `summary-section-${idx}`;
+    tocHtml += `<li class="toc-item" data-subtopic="${escapeHtml(section.subtopic || '')}" data-section-id="${id}">${escapeHtml(section.subtopic || `Раздел ${idx + 1}`)}</li>`;
+    contentHtml += `<section id="${id}" class="summary-section" data-subtopic="${escapeHtml(section.subtopic || '')}"><h3>${escapeHtml(section.subtopic || `Раздел ${idx + 1}`)}</h3><div class="content">${formatMarkdownToHtml(section.content || '')}</div></section>`;
+  }
+  tocHtml += '</ul></div>';
+  contentHtml += '</div>';
   summaryContainer.innerHTML = `<div class="summary-layout">${tocHtml}${contentHtml}</div>`;
   summaryContainer.querySelectorAll('.toc-item').forEach((item) => {
     item.addEventListener('click', () => {
-      const subtopic = item.getAttribute('data-subtopic') || '';
-      activeSummarySubtopic = subtopic;
+      activeSummarySubtopic = item.getAttribute('data-subtopic') || '';
       syncSummarySelection();
       setTimeout(() => {
         document.getElementById(item.getAttribute('data-section-id'))?.scrollIntoView({ behavior: 'smooth', block: 'start' });

@@ -88,7 +88,8 @@ function restoreMathSegments(text, mathParts) {
 
 function normalizeTextBreaks(text) {
   return (text || '')
-    .replace(/\\n/g, '\n');
+    .replace(/\\n/g, '\n')
+    .replace(/\u2014/g, '-');
 }
 
 function removePunctuationAfterBlockMath(text) {
@@ -100,7 +101,8 @@ function removePunctuationAfterBlockMath(text) {
 
 function normalizeQuizText(text) {
   return (text || '')
-    .replace(/\\n/g, '\n');
+    .replace(/\\n/g, '\n')
+    .replace(/\u2014/g, '-');
 }
 
 function normalizePracticeState(raw) {
@@ -1054,6 +1056,10 @@ function markdownInlineToHtml(text) {
   return restoreMathSegments(html, protectedMath.mathParts);
 }
 
+function stripListMarker(text) {
+  return String(text || '').replace(/^\s*[\*\-]\s+/, '').trim();
+}
+
 function markdownInlineToHtmlQuiz(text) {
   let html = escapeHtml(normalizeQuizText(text));
   const protectedMath = protectMathSegments(html);
@@ -1149,7 +1155,7 @@ function formatMarkdownToHtml(text) {
       if (isListLine(current)) {
         const listItems = [];
         while (i < lines.length && isListLine(lines[i])) {
-          listItems.push(`<li>${renderInline(lines[i].replace(/^[\*\-\u2013\u2014]\s+/, '').trim())}</li>`);
+          listItems.push(`<li>${renderInline(stripListMarker(lines[i]))}</li>`);
           i += 1;
         }
         parts.push(`<ul>${listItems.join('')}</ul>`);
@@ -1231,7 +1237,7 @@ function formatMarkdownToHtmlEditor(text) {
       if (isListLine(current)) {
         const listItems = [];
         while (i < lines.length && isListLine(lines[i])) {
-          listItems.push(`<li>${renderInline(lines[i].replace(/^[\*\-\u2013\u2014]\s+/, '').trim())}</li>`);
+          listItems.push(`<li>${renderInline(stripListMarker(lines[i]))}</li>`);
           i += 1;
         }
         parts.push(`<ul>${listItems.join('')}</ul>`);
@@ -2961,8 +2967,6 @@ function renderAnalytics(gen) {
     analyticsContainer.innerHTML = `
       <div class="analytics-stack">
         ${renderSpeechAnalysisLoadingCard(gen, {
-          retry: true,
-          retryDisabled: true,
           message: 'Повторно запрашиваем анализ речи преподавателя...'
         })}
 
@@ -2979,8 +2983,6 @@ function renderAnalytics(gen) {
         analyticsContainer.innerHTML = `
           <div class="analytics-stack">
             ${renderSpeechAnalysisLoadingCard(gen, {
-              retry: true,
-              retryDisabled: true,
               message: 'Повторно запрашиваем анализ речи преподавателя...'
             })}
 
@@ -3006,13 +3008,13 @@ function renderAnalytics(gen) {
     analyticsContainer.innerHTML = `
       <div class="analytics-stack">
         ${ shouldShowLoader
-          ? renderSpeechAnalysisLoadingCard(gen, { retry: false, message: 'Ищем анализ речи преподавателя...' })
+          ? renderSpeechAnalysisLoadingCard(gen, { message: 'Ищем анализ речи преподавателя...' })
           : ((speechAnalysisError || generationFailed || speechAnalysisTimedOut)
           ? renderSpeechAnalysisErrorCard(
               rateLimitSpeechError ? 'Rate limit reached' : errorMessage,
               { retry: shouldRetry, retryDisabled: false }
             )
-          : renderSpeechAnalysisLoadingCard(gen, { retry: false, message: 'Ищем анализ речи преподавателя...' }))}
+          : renderSpeechAnalysisLoadingCard(gen, { message: 'Ищем анализ речи преподавателя...' }))}
 
         ${renderAuxAnalyticsCards()}
       </div>
@@ -3140,10 +3142,7 @@ function openSpeechTranscriptFragment(gen, startMs, endMs = null) {
   });
 }
 
-function renderSpeechAnalysisLoadingCard(gen, { retry = false, retryDisabled = false, message = '' } = {}) {
-  const retryButton = retry
-    ? `<div class="speech-analysis-action"><button type="button" class="speech-export-btn" data-speech-retry="true" ${retryDisabled ? 'disabled aria-disabled="true"' : ''}>Попробовать снова</button></div>`
-    : '';
+function renderSpeechAnalysisLoadingCard(gen, { message = '' } = {}) {
   return `
     <section class="analytics-card speech-analysis-card">
       <div class="analytics-title">Анализ речи преподавателя</div>
@@ -3151,7 +3150,6 @@ function renderSpeechAnalysisLoadingCard(gen, { retry = false, retryDisabled = f
         <div class="spinner-small"></div>
         <div class="speech-analysis-loader-text">${escapeHtml(message || 'Ищем анализ речи преподавателя...')}</div>
       </div>
-      ${retryButton}
     </section>
   `;
 }
@@ -3416,22 +3414,16 @@ window.retryGeneration = async function retryGeneration() {
   const gen = getActiveGeneration();
   if (!gen || gen.status === 'processing') return;
   const previousStatus = gen.status;
-  const hasSummaryAndQuiz = Array.isArray(gen.summary) && gen.summary.length > 0 && Array.isArray(gen.quiz) && gen.quiz.length > 0;
   const speechState = getSpeechAnalysisState(gen);
   if (speechState) {
     speechState.speechAnalysisRetryPending = true;
     speechState.speechAnalysisRetryStartedAt = Date.now();
   }
-  setActiveTab('transcript', gen, true);
   gen.status = 'processing';
   gen.error_message = '';
   renderActiveGeneration();
   try {
     await api(`/api/generations/${gen.id}/retry`, { method: 'POST' });
-    gen.error_message = '';
-    if (!hasSummaryAndQuiz) {
-      gen.status = 'processing';
-    }
     await pollGenerationUntilSettled(gen.id);
     if (speechState) {
       speechState.speechAnalysisRetryPending = false;
