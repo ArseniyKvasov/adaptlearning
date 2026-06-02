@@ -3013,18 +3013,18 @@ function renderAnalytics(gen) {
         ? (gen.error_message || 'Аналитика недоступна из-за ошибки генерации.')
         : (speechAnalysisTimedOut
         ? 'Анализ речи преподавателя не получен за 12 минут.'
-        : 'Ищем анализ речи преподавателя...'));
+        : 'Проводим анализ речи преподавателя...'));
     const shouldShowLoader = gen.status === 'processing' && hasQuiz && !speechAnalysisError && !speechAnalysisTimedOut && !generationFailed;
     analyticsContainer.innerHTML = `
       <div class="analytics-stack">
         ${ shouldShowLoader
-          ? renderSpeechAnalysisLoadingCard(gen, { message: 'Ищем анализ речи преподавателя...' })
+          ? renderSpeechAnalysisLoadingCard(gen, { message: 'Проводим анализ речи преподавателя...' })
           : ((speechAnalysisError || generationFailed || speechAnalysisTimedOut)
           ? renderSpeechAnalysisErrorCard(
               rateLimitSpeechError ? 'Rate limit reached' : errorMessage,
               { retry: shouldRetry, retryDisabled: false }
             )
-          : renderSpeechAnalysisLoadingCard(gen, { message: 'Ищем анализ речи преподавателя...' }))}
+          : renderSpeechAnalysisLoadingCard(gen, { message: 'Проводим анализ речи преподавателя...' }))}
 
         ${renderAuxAnalyticsCards()}
       </div>
@@ -3158,7 +3158,7 @@ function renderSpeechAnalysisLoadingCard(gen, { message = '' } = {}) {
       <div class="analytics-title">Анализ речи преподавателя</div>
       <div class="speech-analysis-loader">
         <div class="spinner-small"></div>
-        <div class="speech-analysis-loader-text">${escapeHtml(message || 'Ищем анализ речи преподавателя...')}</div>
+        <div class="speech-analysis-loader-text">${escapeHtml(message || 'Проводим анализ речи преподавателя...')}</div>
       </div>
     </section>
   `;
