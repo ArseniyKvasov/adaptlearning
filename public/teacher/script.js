@@ -450,6 +450,7 @@ function flattenChunkField(chunkAnalyses, field) {
 function buildSpeechAnalysisViewModel(gen) {
   const raw = getSpeechAnalysisAggregate(gen);
   if (!raw) return null;
+  const analysisType = String(raw.speech_analysis_type || '').trim().toLowerCase();
   const chunkAnalyses = chunkAnalysesFromRaw(raw);
   const legacyAudience = raw.audience_engagement && typeof raw.audience_engagement === 'object' ? raw.audience_engagement : {};
   const legacyStructure = raw.lesson_structure && typeof raw.lesson_structure === 'object' ? raw.lesson_structure : {};
@@ -502,10 +503,17 @@ function buildSpeechAnalysisViewModel(gen) {
     if (Array.isArray(flags.overly_familiar_tone)) derivedFlags.familiarity.push(...flags.overly_familiar_tone);
   });
   derivedTimeline.sort((a, b) => Number(a.start_ms || 0) - Number(b.start_ms || 0));
+  const isAggregated = analysisType === 'aggregated';
+  const formatLabel = isAggregated
+    ? 'Агрегированный результат анализа речи преподавателя'
+    : String(raw.lesson_format && raw.lesson_format.format ? raw.lesson_format.format : (chunkAnalyses.length ? 'Формат занятия не определен' : 'Формат занятия не определен'));
+  const formatComment = isAggregated
+    ? String(raw.lesson_format && raw.lesson_format.comment ? raw.lesson_format.comment : (chunkAnalyses.length ? `Проанализировано чанков: ${chunkAnalyses.length}` : 'Результат собран по частям.'))
+    : String(raw.lesson_format && raw.lesson_format.comment ? raw.lesson_format.comment : (chunkAnalyses.length ? `Проанализировано чанков: ${chunkAnalyses.length}` : 'Агрегированный анализ речи преподавателя готов.'));
   return {
     format: {
-      label: String(raw.lesson_format && raw.lesson_format.format ? raw.lesson_format.format : (chunkAnalyses.length ? 'Агрегированный анализ речи преподавателя' : 'Формат занятия не определен')),
-      comment: String(raw.lesson_format && raw.lesson_format.comment ? raw.lesson_format.comment : (chunkAnalyses.length ? `Проанализировано чанков: ${chunkAnalyses.length}` : 'Агрегированный анализ речи преподавателя готов.')),
+      label: formatLabel,
+      comment: formatComment,
     },
     engagement: {
       questions: {
@@ -2895,9 +2903,8 @@ function renderAnalytics(gen) {
   const speechRetryPending = Boolean(speechExpanded && speechExpanded.speechAnalysisRetryPending);
   const hasSpeechAnalysis = Boolean(speechAnalysis);
   const hasQuiz = Array.isArray(gen.quiz) && gen.quiz.length > 0;
-  const isAggregatedSpeechResult = /агрегирован/i.test(String(speechAnalysis?.format?.label || ''))
-    || /агрегирован/i.test(String(speechAnalysis?.format?.comment || ''));
-  const showSpeechRetryButton = Boolean(speechAnalysisError || generationFailed || speechAnalysisTimedOut || isAggregatedSpeechResult);
+  const speechAnalysisType = String(analytics.speech_analysis_type || '').trim().toLowerCase();
+  const showSpeechRetryButton = Boolean(speechAnalysisError || generationFailed || speechAnalysisTimedOut || speechAnalysisType === 'aggregated');
   const rateLimitSpeechError = /rate limit reached/i.test(speechAnalysisError);
   const masteryHtml = mastery
     .map((item) => {

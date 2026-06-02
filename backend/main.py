@@ -211,6 +211,46 @@ def row_to_generation(row: sqlite3.Row) -> dict[str, Any]:
     }
 
 
+SPEECH_ANALYSIS_TYPE_MAIN = "main"
+SPEECH_ANALYSIS_TYPE_AGGREGATED = "aggregated"
+SPEECH_ANALYSIS_AGGREGATE_KEYS = (
+    "lesson_format",
+    "audience_engagement",
+    "lesson_structure",
+    "material_explanation",
+    "teacher_recommendation",
+    "flags",
+)
+
+
+def detect_speech_analysis_type(speech_analysis: Any) -> str:
+    if not isinstance(speech_analysis, dict) or not speech_analysis:
+        return ""
+    explicit = str(speech_analysis.get("speech_analysis_type") or "").strip().lower()
+    if explicit in {SPEECH_ANALYSIS_TYPE_MAIN, SPEECH_ANALYSIS_TYPE_AGGREGATED}:
+        return explicit
+    if any(isinstance(speech_analysis.get(key), dict) and speech_analysis.get(key) for key in SPEECH_ANALYSIS_AGGREGATE_KEYS):
+        return SPEECH_ANALYSIS_TYPE_MAIN
+    if isinstance(speech_analysis.get("chunk_analyses"), list):
+        return SPEECH_ANALYSIS_TYPE_AGGREGATED
+    return SPEECH_ANALYSIS_TYPE_MAIN
+
+
+def normalize_analytics_speech_type(analytics: dict[str, Any]) -> bool:
+    if not isinstance(analytics, dict):
+        return False
+    speech_analysis = analytics.get("speech_analysis")
+    if not isinstance(speech_analysis, dict) or not speech_analysis:
+        return False
+    speech_type = detect_speech_analysis_type(speech_analysis)
+    if not speech_type:
+        return False
+    if analytics.get("speech_analysis_type") == speech_type:
+        return False
+    analytics["speech_analysis_type"] = speech_type
+    return True
+
+
 def content_hash_for_bytes(file_bytes: bytes) -> str:
     return hashlib.sha256(file_bytes).hexdigest()
 
@@ -286,7 +326,20 @@ def get_generation(generation_id: str) -> Optional[dict[str, Any]]:
     conn = db_conn()
     row = conn.execute("SELECT * FROM generations WHERE id = ?", (generation_id,)).fetchone()
     conn.close()
-    return row_to_generation(row) if row else None
+    if not row:
+        return None
+    generation = row_to_generation(row)
+    analytics = generation.get("analytics") if isinstance(generation.get("analytics"), dict) else {}
+    if normalize_analytics_speech_type(analytics):
+        conn = db_conn()
+        conn.execute(
+            "UPDATE generations SET analytics_json = ? WHERE id = ?",
+            (json.dumps(analytics, ensure_ascii=False), generation_id),
+        )
+        conn.commit()
+        conn.close()
+        generation["analytics"] = analytics
+    return generation
 
 
 def default_practice_state() -> dict[str, Any]:
@@ -1212,6 +1265,9 @@ def build_analytics(
     }
     if isinstance(speech_analysis, dict) and speech_analysis:
         analytics["speech_analysis"] = speech_analysis
+        speech_type = detect_speech_analysis_type(speech_analysis)
+        if speech_type:
+            analytics["speech_analysis_type"] = speech_type
     if str(speech_analysis_error or "").strip():
         analytics["speech_analysis_error"] = str(speech_analysis_error).strip()
     return analytics
@@ -1221,6 +1277,9 @@ def merge_speech_analysis_into_analytics(analytics: dict[str, Any], speech_analy
     merged = dict(analytics or {})
     if isinstance(speech_analysis, dict) and speech_analysis:
         merged["speech_analysis"] = speech_analysis
+        speech_type = detect_speech_analysis_type(speech_analysis)
+        if speech_type:
+            merged["speech_analysis_type"] = speech_type
     return merged
 
 
@@ -3479,15 +3538,18 @@ async def build_teacher_analysis(
         print("Teacher analysis produced no usable chunk analyses")
         return {}
 
+    speech_analysis_type = SPEECH_ANALYSIS_TYPE_MAIN
     try:
         aggregate = await ml_client.make_teacher_analysis_aggregate(list(chunk_analyses))
     except Exception as exc:
         print("Teacher analysis aggregate failed:", exc)
         aggregate = {}
+        speech_analysis_type = SPEECH_ANALYSIS_TYPE_AGGREGATED
 
     if not isinstance(aggregate, dict):
         aggregate = {}
     aggregate["chunk_analyses"] = list(chunk_analyses)
+    aggregate["speech_analysis_type"] = speech_analysis_type
     if failed_chunks:
         aggregate["chunk_failures"] = failed_chunks
     return aggregate
