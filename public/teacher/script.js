@@ -348,8 +348,14 @@ function getSpeechAnalysisAggregate(gen) {
 function isAggregatedSpeechAnalysis(gen) {
   const speech = getSpeechAnalysisAggregate(gen);
   if (!speech) return false;
-  const chunkAnalyses = Array.isArray(speech.chunk_analyses) ? speech.chunk_analyses : [];
-  return chunkAnalyses.length > 1 || Number(speech.chunk_failures || 0) > 0;
+  return Boolean(
+    (speech.lesson_format && typeof speech.lesson_format === 'object')
+    || (speech.audience_engagement && typeof speech.audience_engagement === 'object')
+    || (speech.lesson_structure && typeof speech.lesson_structure === 'object')
+    || (speech.material_explanation && typeof speech.material_explanation === 'object')
+    || (speech.teacher_recommendation && typeof speech.teacher_recommendation === 'object')
+    || (speech.flags && typeof speech.flags === 'object')
+  );
 }
 
 function getSpeechAnalysisError(gen) {
