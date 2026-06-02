@@ -345,19 +345,6 @@ function getSpeechAnalysisAggregate(gen) {
   return speech;
 }
 
-function isAggregatedSpeechAnalysis(gen) {
-  const speech = getSpeechAnalysisAggregate(gen);
-  if (!speech) return false;
-  return Boolean(
-    (speech.lesson_format && typeof speech.lesson_format === 'object')
-    || (speech.audience_engagement && typeof speech.audience_engagement === 'object')
-    || (speech.lesson_structure && typeof speech.lesson_structure === 'object')
-    || (speech.material_explanation && typeof speech.material_explanation === 'object')
-    || (speech.teacher_recommendation && typeof speech.teacher_recommendation === 'object')
-    || (speech.flags && typeof speech.flags === 'object')
-  );
-}
-
 function getSpeechAnalysisError(gen) {
   const analytics = gen && gen.analytics && typeof gen.analytics === 'object' ? gen.analytics : null;
   if (!analytics) return '';
@@ -2908,7 +2895,9 @@ function renderAnalytics(gen) {
   const speechRetryPending = Boolean(speechExpanded && speechExpanded.speechAnalysisRetryPending);
   const hasSpeechAnalysis = Boolean(speechAnalysis);
   const hasQuiz = Array.isArray(gen.quiz) && gen.quiz.length > 0;
-  const showSpeechRetryButton = Boolean(speechAnalysisError || generationFailed || speechAnalysisTimedOut || isAggregatedSpeechAnalysis(gen));
+  const isAggregatedSpeechResult = /агрегирован/i.test(String(speechAnalysis?.format?.label || ''))
+    || /агрегирован/i.test(String(speechAnalysis?.format?.comment || ''));
+  const showSpeechRetryButton = Boolean(speechAnalysisError || generationFailed || speechAnalysisTimedOut || isAggregatedSpeechResult);
   const rateLimitSpeechError = /rate limit reached/i.test(speechAnalysisError);
   const masteryHtml = mastery
     .map((item) => {
