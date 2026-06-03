@@ -96,6 +96,14 @@ function removePunctuationAfterBlockMath(text) {
   });
 }
 
+function prepareSummaryTextForDisplay(text) {
+  const normalized = normalizeTextBreaks(removePunctuationAfterBlockMath(text));
+  const lines = normalized.split(/\r?\n/);
+  const trimmedBackslashes = lines.map((line) => (line.endsWith('\\') ? line.slice(0, -1) : line));
+  const removedDividerLines = trimmedBackslashes.map((line) => (line.trim() === '---' ? '' : line));
+  return removedDividerLines.join('\n');
+}
+
 function normalizeQuizText(text) {
   return normalizeTextWithMathSegments(text);
 }
@@ -372,7 +380,7 @@ function markdownInlineToHtmlQuiz(text) {
 }
 
 function formatMarkdownToHtml(text) {
-  const source = escapeHtml(normalizeTextBreaks(removePunctuationAfterBlockMath(text)));
+  const source = escapeHtml(prepareSummaryTextForDisplay(text));
   const protectedMath = protectMathSegments(source);
   let html = protectedMath.text;
 
