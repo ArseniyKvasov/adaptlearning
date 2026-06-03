@@ -1160,7 +1160,7 @@ function formatMarkdownToHtml(text) {
       });
     }
 
-    const lines = block.split('\n').map((line) => line.trimEnd()).filter(Boolean);
+    const lines = block.split('\n').map((line) => line.trimEnd());
     const isTableDivider = (line) => {
       const cells = line.split('|').map((cell) => cell.trim()).filter(Boolean);
       return cells.length >= 2 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
@@ -1179,6 +1179,12 @@ function formatMarkdownToHtml(text) {
     while (i < lines.length) {
       const current = lines[i];
       const next = lines[i + 1] || '';
+
+      if (!current) {
+        parts.push('<p><br></p>');
+        i += 1;
+        continue;
+      }
 
       if (current && current.includes('|') && isTableDivider(next)) {
         const tableLines = [current, next];
@@ -1238,7 +1244,7 @@ function formatMarkdownToHtmlEditor(text) {
   const blocks = html.split(/\n{2,}/).map((block) => block.trim()).filter(Boolean);
 
   const formattedBlocks = blocks.map((block) => {
-    const lines = block.split('\n').map((line) => line.trimEnd()).filter(Boolean);
+    const lines = block.split('\n').map((line) => line.trimEnd());
     const renderInline = (value) => String(value || '')
       .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
       .replace(/\*(.*?)\*/g, '<em>$1</em>')
@@ -1261,6 +1267,12 @@ function formatMarkdownToHtmlEditor(text) {
     while (i < lines.length) {
       const current = lines[i];
       const next = lines[i + 1] || '';
+
+      if (!current) {
+        parts.push('<p><br></p>');
+        i += 1;
+        continue;
+      }
 
       if (current && current.includes('|') && isTableDivider(next)) {
         const tableLines = [current, next];

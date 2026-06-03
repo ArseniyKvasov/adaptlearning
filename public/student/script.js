@@ -424,7 +424,7 @@ function formatMarkdownToHtml(text) {
       });
     }
 
-    const lines = block.split('\n').map((line) => line.trimEnd()).filter(Boolean);
+    const lines = block.split('\n').map((line) => line.trimEnd());
     const isTableDivider = (line) => {
       const cells = line.split('|').map((cell) => cell.trim()).filter(Boolean);
       return cells.length >= 2 && cells.every((cell) => /^:?-{3,}:?$/.test(cell));
@@ -443,6 +443,12 @@ function formatMarkdownToHtml(text) {
     while (i < lines.length) {
       const current = lines[i];
       const next = lines[i + 1] || '';
+
+      if (!current) {
+        parts.push('<p><br></p>');
+        i += 1;
+        continue;
+      }
 
       if (current && current.includes('|') && isTableDivider(next)) {
         const tableLines = [current, next];
