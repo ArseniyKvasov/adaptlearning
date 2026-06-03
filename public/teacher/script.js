@@ -38,7 +38,7 @@ const STATUS_LABELS = {
   completed: 'Готово',
   failed: 'Ошибка'
 };
-const SPEECH_ANALYSIS_WAIT_TIMEOUT_MS = 12 * 60 * 1000;
+const SPEECH_ANALYSIS_WAIT_TIMEOUT_MS = 15 * 60 * 1000;
 const SPEECH_ANALYSIS_POLL_INTERVAL_MS = 3000;
 
 const requestedGenerationId = new URL(window.location.href).searchParams.get('generation_id') || '';
@@ -3062,7 +3062,7 @@ function renderAnalytics(gen) {
       : (generationFailed
         ? (gen.error_message || 'Аналитика недоступна из-за ошибки генерации.')
         : (speechAnalysisTimedOut
-        ? 'Анализ речи преподавателя не получен за 12 минут.'
+        ? 'Анализ речи преподавателя не получен за 15 минут.'
         : 'Проводим анализ речи преподавателя...'));
     const shouldShowLoader = gen.status === 'processing' && hasQuiz && !speechAnalysisError && !speechAnalysisTimedOut && !generationFailed;
     analyticsContainer.innerHTML = `
