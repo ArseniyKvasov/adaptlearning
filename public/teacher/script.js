@@ -2937,8 +2937,6 @@ function renderAnalytics(gen) {
   const speechRetryPending = Boolean(speechExpanded && speechExpanded.speechAnalysisRetryPending);
   const hasSpeechAnalysis = Boolean(speechAnalysis);
   const hasQuiz = Array.isArray(gen.quiz) && gen.quiz.length > 0;
-  const speechAnalysisType = String(analytics.speech_analysis_type || '').trim().toLowerCase();
-  const showSpeechRetryButton = Boolean(speechAnalysisError || generationFailed || speechAnalysisTimedOut || speechAnalysisType === 'aggregated');
   const rateLimitSpeechError = /rate limit reached/i.test(speechAnalysisError);
   const masteryHtml = mastery
     .map((item) => {
@@ -3138,7 +3136,6 @@ function renderAnalytics(gen) {
 
       <div class="speech-analysis-footer">
         <button type="button" class="speech-export-btn" data-speech-export="true">Экспорт в Excel</button>
-        ${showSpeechRetryButton ? '<button type="button" class="speech-export-btn" data-speech-retry="true">Попробовать снова</button>' : ''}
       </div>
     </section>
   `;
