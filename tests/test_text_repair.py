@@ -5,6 +5,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -67,6 +68,7 @@ class StudentApiRepairTests(unittest.TestCase):
         status: str = "completed",
         summary: list[dict[str, object]] | None = None,
         quiz: list[dict[str, object]] | None = None,
+        practice: dict[str, object] | None = None,
     ) -> str:
         generation_id = "gen_test_latex"
         user_id = "user_test_latex"
@@ -112,7 +114,7 @@ class StudentApiRepairTests(unittest.TestCase):
                 "[]",
                 json.dumps(summary, ensure_ascii=False),
                 json.dumps(quiz, ensure_ascii=False),
-                "{}",
+                json.dumps(practice if practice is not None else {}, ensure_ascii=False),
                 "{}",
                 "",
             ),
@@ -207,6 +209,132 @@ class StudentApiRepairTests(unittest.TestCase):
         self.assertEqual(payload["results"][0]["score"], 1)
         persisted = main.get_generation(generation_id)
         self.assertTrue(isinstance(persisted.get("quiz"), list) and len(persisted.get("quiz", [])) == 1)
+
+    def test_student_practice_can_start_before_generation_finishes(self) -> None:
+        generation_id = self._seed_generation(status="processing")
+
+        async def fake_make_practice_summary(self, _practice_context):
+            return [
+                {
+                    "subtopic": "Тема 1",
+                    "content": "Практический конспект.",
+                }
+            ]
+
+        with patch.object(main, "ML_API_KEY", "test-key"), patch.object(main.MLServiceClient, "make_practice_summary", fake_make_practice_summary):
+            with TestClient(main.app) as client:
+                response = client.post(
+                    f"/api/student/{generation_id}/practice",
+                    json={
+                        "weak_subtopics": ["Тема 1"],
+                        "questions": [
+                            {
+                                "question_id": "1",
+                                "question_type": "multiple_choice",
+                                "subtopic": "Тема 1",
+                                "question_text": "Вопрос",
+                                "correct_answer": "A",
+                                "student_answer": "A",
+                                "is_correct": True,
+                                "explanation": "Объяснение",
+                            }
+                        ],
+                        "mastery": {"Тема 1": 40},
+                    },
+                )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["practice"]["status"], "summary_ready")
+        self.assertEqual(payload["practice"]["summary"][0]["subtopic"], "Тема 1")
+
+    def test_student_practice_quiz_can_start_before_generation_finishes(self) -> None:
+        practice_state = {
+            "status": "summary_ready",
+            "stage": "summary",
+            "summary": [
+                {
+                    "subtopic": "Тема 1",
+                    "content": "Практический конспект.",
+                }
+            ],
+            "quiz": [],
+            "weak_subtopics": ["Тема 1"],
+            "current_weak_subtopics": ["Тема 1"],
+            "pending_weak_subtopics": [],
+        }
+        generation_id = self._seed_generation(status="processing", practice=practice_state)
+
+        async def fake_make_quiz(self, _practice_summary):
+            return [
+                {
+                    "question_id": 1,
+                    "question_text": "Практический вопрос",
+                    "question_type": "multiple_choice",
+                    "options": ["A", "B"],
+                    "correct_answer": 1,
+                    "explanation": "Объяснение",
+                    "subtopic": "Тема 1",
+                }
+            ]
+
+        with patch.object(main, "ML_API_KEY", "test-key"), patch.object(main.MLServiceClient, "make_quiz", fake_make_quiz):
+            with TestClient(main.app) as client:
+                response = client.post(f"/api/student/{generation_id}/practice/quiz")
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["practice"]["status"], "completed")
+        self.assertEqual(payload["practice"]["quiz"][0]["question_text"], "Практический вопрос")
+
+    def test_student_practice_complete_can_save_before_generation_finishes(self) -> None:
+        practice_state = {
+            "status": "completed",
+            "stage": "quiz",
+            "summary": [
+                {
+                    "subtopic": "Тема 1",
+                    "content": "Практический конспект.",
+                }
+            ],
+            "quiz": [
+                {
+                    "question_id": 1,
+                    "question_text": "Практический вопрос",
+                    "question_type": "multiple_choice",
+                    "options": ["A", "B"],
+                    "correct_answer": 1,
+                    "explanation": "Объяснение",
+                    "subtopic": "Тема 1",
+                }
+            ],
+            "weak_subtopics": ["Тема 1"],
+            "current_weak_subtopics": ["Тема 1"],
+            "pending_weak_subtopics": [],
+            "mastery": {},
+            "mastery_order": [],
+        }
+        generation_id = self._seed_generation(status="processing", practice=practice_state)
+
+        with TestClient(main.app) as client:
+            response = client.post(
+                f"/api/student/{generation_id}/practice/complete",
+                json={
+                    "answers": [
+                        {
+                            "question_id": "1",
+                            "question_type": "multiple_choice",
+                            "subtopic": "Тема 1",
+                            "is_correct": True,
+                        }
+                    ]
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.json()
+        self.assertEqual(payload["results"][0]["score"], 1)
+        self.assertTrue(payload["practice"]["practice_completed"])
 
 
 if __name__ == "__main__":

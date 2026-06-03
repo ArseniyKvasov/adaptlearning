@@ -363,6 +363,20 @@ def generation_has_student_material(generation: Optional[dict[str, Any]]) -> boo
     return isinstance(summary, list) and bool(summary) and isinstance(quiz, list) and bool(quiz)
 
 
+def generation_has_practice_summary(generation: Optional[dict[str, Any]]) -> bool:
+    if not generation or generation.get("status") == "failed":
+        return False
+    practice = normalize_practice_state(generation.get("practice", {}))
+    return isinstance(practice.get("summary"), list) and bool(practice.get("summary"))
+
+
+def generation_has_practice_quiz(generation: Optional[dict[str, Any]]) -> bool:
+    if not generation or generation.get("status") == "failed":
+        return False
+    practice = normalize_practice_state(generation.get("practice", {}))
+    return isinstance(practice.get("quiz"), list) and bool(practice.get("quiz"))
+
+
 def default_practice_state() -> dict[str, Any]:
     return {
         "status": "idle",
@@ -4072,7 +4086,7 @@ async def api_student(request: Request, generation_id: str):
 async def api_student_practice(request: Request, generation_id: str, payload: dict[str, Any]):
     ensure_guest_user(request)
     generation = get_generation(generation_id)
-    if not generation or generation.get("status") != "completed":
+    if not generation_has_student_material(generation):
         raise HTTPException(status_code=404, detail="Материал недоступен.")
     payload = payload if isinstance(payload, dict) else {}
     questions = payload.get("questions", [])
@@ -4263,7 +4277,7 @@ async def api_student_practice(request: Request, generation_id: str, payload: di
 async def api_student_practice_quiz(request: Request, generation_id: str):
     ensure_guest_user(request)
     generation = get_generation(generation_id)
-    if not generation or generation.get("status") != "completed":
+    if not generation_has_student_material(generation):
         raise HTTPException(status_code=404, detail="Материал недоступен.")
 
     practice = normalize_practice_state(generation.get("practice", {}))
@@ -4324,7 +4338,7 @@ async def api_student_practice_quiz(request: Request, generation_id: str):
 async def api_student_practice_complete(request: Request, generation_id: str, payload: dict[str, Any]):
     ensure_guest_user(request)
     generation = get_generation(generation_id)
-    if not generation or generation.get("status") != "completed":
+    if not generation_has_practice_quiz(generation):
         raise HTTPException(status_code=404, detail="Материал недоступен.")
 
     practice = normalize_practice_state(generation.get("practice", {}))
