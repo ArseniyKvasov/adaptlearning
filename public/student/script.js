@@ -605,6 +605,7 @@ function reviseButtonHtml(subtopic) {
 
 function buildCheckPayload() {
   return {
+    quiz: Array.isArray(quizData) ? quizData : [],
     answers: quizData.map((q, idx) => {
       const qid = String(q.question_id || idx + 1);
       const qtype = q.question_type === 'open_ended' || q.question_type === 'open_question' ? 'open_question' : 'multiple_choice';

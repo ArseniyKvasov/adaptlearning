@@ -348,6 +348,21 @@ def get_generation(generation_id: str) -> Optional[dict[str, Any]]:
     return generation
 
 
+def generation_has_student_quiz(generation: Optional[dict[str, Any]]) -> bool:
+    if not generation or generation.get("status") == "failed":
+        return False
+    quiz = generation.get("quiz")
+    return isinstance(quiz, list) and bool(quiz)
+
+
+def generation_has_student_material(generation: Optional[dict[str, Any]]) -> bool:
+    if not generation or generation.get("status") == "failed":
+        return False
+    summary = generation.get("summary")
+    quiz = generation.get("quiz")
+    return isinstance(summary, list) and bool(summary) and isinstance(quiz, list) and bool(quiz)
+
+
 def default_practice_state() -> dict[str, Any]:
     return {
         "status": "idle",
@@ -2900,9 +2915,11 @@ def save_student_attempt(
     results: list[dict[str, Any]],
     recommendation: str,
     subtopic_to_revise: str,
+    quiz: Optional[list[dict[str, Any]]] = None,
 ) -> dict[str, Any]:
     generation = get_generation(generation_id)
-    mastery = build_mastery_from_results(results, quiz_subtopics(generation.get("quiz", [])) if generation else [])
+    quiz_source = quiz if isinstance(quiz, list) else (generation.get("quiz", []) if generation else [])
+    mastery = build_mastery_from_results(results, quiz_subtopics(quiz_source))
     conn = db_conn()
     conn.execute(
         """
@@ -4039,7 +4056,7 @@ async def api_generation_patch(request: Request, generation_id: str, payload: di
 async def api_student(request: Request, generation_id: str):
     user_id = ensure_guest_user(request)
     generation = get_generation(generation_id)
-    if not generation or generation.get("status") != "completed":
+    if not generation_has_student_material(generation):
         raise HTTPException(status_code=404, detail="Not found")
     attempt = load_student_attempt(generation_id, user_id)
     return {
@@ -4370,14 +4387,22 @@ async def api_student_practice_complete(request: Request, generation_id: str, pa
 async def api_student_check(request: Request, generation_id: str, payload: dict[str, Any]):
     user_id = ensure_guest_user(request)
     generation = get_generation(generation_id)
-    if not generation or generation.get("status") != "completed":
+    payload = payload if isinstance(payload, dict) else {}
+
+    quiz = generation.get("quiz", []) if generation and isinstance(generation.get("quiz"), list) else []
+    payload_quiz = payload.get("quiz", [])
+    if (not quiz) and isinstance(payload_quiz, list) and payload_quiz:
+        quiz = payload_quiz
+        if generation:
+            update_generation(generation_id, {"quiz": quiz})
+
+    if not quiz:
         raise HTTPException(status_code=404, detail="Материал недоступен.")
 
     existing_attempt = load_student_attempt(generation_id, user_id)
     if existing_attempt:
         return existing_attempt
 
-    quiz = generation.get("quiz", [])
     quiz_subtopics_list = quiz_subtopics(quiz)
     answers = payload.get("answers", [])
     if not isinstance(answers, list):
@@ -4444,7 +4469,7 @@ async def api_student_check(request: Request, generation_id: str, payload: dict[
     recommendation = summarize_recommendations(recommendations)
     subtopic_to_revise = choose_subtopic_to_revise(recommendations)
 
-    attempt = save_student_attempt(generation_id, user_id, answers, results, recommendation, subtopic_to_revise)
+    attempt = save_student_attempt(generation_id, user_id, answers, results, recommendation, subtopic_to_revise, quiz=quiz)
 
     return {
         "results": results,

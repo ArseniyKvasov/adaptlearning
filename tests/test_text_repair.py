@@ -62,10 +62,15 @@ class StudentApiRepairTests(unittest.TestCase):
         main.DB_PATH = self._old_db_path
         self._tmpdir.cleanup()
 
-    def _seed_generation(self) -> str:
+    def _seed_generation(
+        self,
+        status: str = "completed",
+        summary: list[dict[str, object]] | None = None,
+        quiz: list[dict[str, object]] | None = None,
+    ) -> str:
         generation_id = "gen_test_latex"
         user_id = "user_test_latex"
-        summary = [
+        summary = summary if summary is not None else [
             {
                 "subtopic": "Тема 1",
                 "content": "Формула: \\(\\displaystyle\\int_{c}^{d}\\!\\!\\int_{\\alpha(y)}^"
@@ -75,7 +80,7 @@ class StudentApiRepairTests(unittest.TestCase):
                 + "\\,dx\\,dy\\)"
             }
         ]
-        quiz = [
+        quiz = quiz if quiz is not None else [
             {
                 "question_id": 1,
                 "question_text": "Что означает \\(" + "\frac" + "{1}{2}\\)?",
@@ -100,7 +105,7 @@ class StudentApiRepairTests(unittest.TestCase):
                 user_id,
                 user_id,
                 "demo.mp4",
-                "completed",
+                status,
                 100,
                 main.now_iso(),
                 "[]",
@@ -137,6 +142,71 @@ class StudentApiRepairTests(unittest.TestCase):
         self.assertIn("\\frac{1}{2}", question_text)
         self.assertIn("\\beta", explanation)
         self.assertIn("\\nabla", explanation)
+
+    def test_student_quiz_check_is_available_before_analytics_finishes(self) -> None:
+        generation_id = self._seed_generation(status="processing")
+
+        with TestClient(main.app) as client:
+            page_response = client.get(f"/api/student/{generation_id}")
+            check_response = client.post(
+                f"/api/student/{generation_id}/check",
+                json={
+                    "answers": [
+                        {
+                            "question_id": "1",
+                            "question_type": "multiple_choice",
+                            "subtopic": "Тема 1",
+                            "is_correct": True,
+                        }
+                    ]
+                },
+            )
+
+        self.assertEqual(page_response.status_code, 200)
+        self.assertEqual(check_response.status_code, 200)
+        payload = check_response.json()
+        self.assertEqual(payload["results"][0]["score"], 1)
+        self.assertEqual(payload["recommendation"], "Отлично: все подтемы теста освоены.")
+
+    def test_student_quiz_check_can_use_payload_quiz_before_db_persisted(self) -> None:
+        generation_id = self._seed_generation(
+            status="processing",
+            summary=[],
+            quiz=[],
+        )
+        payload_quiz = [
+            {
+                "question_id": 1,
+                "question_text": "Что означает 1/2?",
+                "question_type": "multiple_choice",
+                "options": ["A", "B", "C"],
+                "correct_answer": 1,
+                "explanation": "Верный ответ B.",
+                "subtopic": "Тема 1",
+            }
+        ]
+
+        with TestClient(main.app) as client:
+            check_response = client.post(
+                f"/api/student/{generation_id}/check",
+                json={
+                    "quiz": payload_quiz,
+                    "answers": [
+                        {
+                            "question_id": "1",
+                            "question_type": "multiple_choice",
+                            "subtopic": "Тема 1",
+                            "is_correct": True,
+                        }
+                    ],
+                },
+            )
+
+        self.assertEqual(check_response.status_code, 200)
+        payload = check_response.json()
+        self.assertEqual(payload["results"][0]["score"], 1)
+        persisted = main.get_generation(generation_id)
+        self.assertTrue(isinstance(persisted.get("quiz"), list) and len(persisted.get("quiz", [])) == 1)
 
 
 if __name__ == "__main__":

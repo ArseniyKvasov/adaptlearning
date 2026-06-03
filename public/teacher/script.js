@@ -1816,6 +1816,7 @@ function formatRecommendationAction(action) {
 
 function buildQuizCheckPayload(gen) {
   return {
+    quiz: Array.isArray(gen.quiz) ? gen.quiz : [],
     answers: gen.quiz.map((q, idx) => {
       const qid = String(q.question_id || idx + 1);
       const qtype = q.question_type === 'open_ended' || q.question_type === 'open_question' ? 'open_question' : 'multiple_choice';
