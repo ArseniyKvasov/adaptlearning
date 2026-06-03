@@ -495,8 +495,8 @@ function flattenChunkField(chunkAnalyses, field) {
 function buildSpeechAnalysisViewModel(gen) {
   const raw = getSpeechAnalysisAggregate(gen);
   if (!raw) return null;
-  const analysisType = String(raw.speech_analysis_type || '').trim().toLowerCase();
   const chunkAnalyses = chunkAnalysesFromRaw(raw);
+  const lessonFormatRaw = raw.lesson_format && typeof raw.lesson_format === 'object' ? raw.lesson_format : {};
   const legacyAudience = raw.audience_engagement && typeof raw.audience_engagement === 'object' ? raw.audience_engagement : {};
   const legacyStructure = raw.lesson_structure && typeof raw.lesson_structure === 'object' ? raw.lesson_structure : {};
   const legacyExplanation = raw.material_explanation && typeof raw.material_explanation === 'object' ? raw.material_explanation : {};
@@ -548,13 +548,8 @@ function buildSpeechAnalysisViewModel(gen) {
     if (Array.isArray(flags.overly_familiar_tone)) derivedFlags.familiarity.push(...flags.overly_familiar_tone);
   });
   derivedTimeline.sort((a, b) => Number(a.start_ms || 0) - Number(b.start_ms || 0));
-  const isAggregated = analysisType === 'aggregated';
-  const formatLabel = isAggregated
-    ? 'Агрегированный результат анализа речи преподавателя'
-    : String(raw.lesson_format && raw.lesson_format.format ? raw.lesson_format.format : (chunkAnalyses.length ? 'Формат занятия не определен' : 'Формат занятия не определен'));
-  const formatComment = isAggregated
-    ? String(raw.lesson_format && raw.lesson_format.comment ? raw.lesson_format.comment : (chunkAnalyses.length ? `Проанализировано чанков: ${chunkAnalyses.length}` : 'Результат собран по частям.'))
-    : String(raw.lesson_format && raw.lesson_format.comment ? raw.lesson_format.comment : (chunkAnalyses.length ? `Проанализировано чанков: ${chunkAnalyses.length}` : 'Агрегированный анализ речи преподавателя готов.'));
+  const formatLabel = String(lessonFormatRaw.format || '').trim() || (chunkAnalyses.length ? 'Агрегированный результат анализа речи преподавателя' : 'Формат занятия не определен');
+  const formatComment = String(lessonFormatRaw.comment || '').trim() || (chunkAnalyses.length ? `Проанализировано чанков: ${chunkAnalyses.length}` : 'Агрегированный анализ речи преподавателя готов.');
   return {
     format: {
       label: formatLabel,
