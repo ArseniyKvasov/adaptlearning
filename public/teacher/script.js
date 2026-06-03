@@ -2148,14 +2148,13 @@ function renderPracticeSummary(gen) {
     return;
   }
 
-  const summaryHtml = summary
-    .map((section, idx) => `
-      <div class="practice-section">
-        <h4>${escapeHtml(section.subtopic || `Раздел ${idx + 1}`)}</h4>
-        <div class="content">${formatMarkdownToHtml(section.content || '')}</div>
-      </div>
-    `)
-    .join('<hr class="practice-divider">');
+  const summaryHtml = buildSummaryLayoutHtml(summary, {
+    includeToc: false,
+    sectionClassName: 'practice-section',
+    headingTag: 'h4',
+    headingPrefix: 'Раздел',
+    emptyMessage: 'Практика пока недоступна'
+  });
 
   if (practice.round_submitted) {
     const isFinal = practice.practice_completed || !(Array.isArray(practice.pending_weak_subtopics) && practice.pending_weak_subtopics.length);
@@ -2669,6 +2668,38 @@ async function checkTeacherQuizResults(gen, force = false) {
   }
 }
 
+function buildSummaryLayoutHtml(sections, { includeToc = true, sectionClassName = 'summary-section', headingTag = 'h3', headingPrefix = 'Раздел', tocTitle = 'Оглавление', emptyMessage = 'Конспект отсутствует' } = {}) {
+  const items = Array.isArray(sections) ? sections : [];
+  if (!items.length) {
+    return `<div class="status-message">${escapeHtml(emptyMessage)}</div>`;
+  }
+
+  if (!includeToc) {
+    return `
+      <div class="summary-content">
+        ${items.map((section, idx) => `
+          <section class="${sectionClassName}" data-subtopic="${escapeHtml(section.subtopic || '')}">
+            <${headingTag}>${escapeHtml(section.subtopic || `${headingPrefix} ${idx + 1}`)}</${headingTag}>
+            <div class="content">${formatMarkdownToHtml(section.content || '')}</div>
+          </section>
+        `).join('')}
+      </div>
+    `;
+  }
+
+  let tocHtml = `<div class="summary-toc"><h4>${escapeHtml(tocTitle)}</h4><ul class="toc-list">`;
+  let contentHtml = '<div class="summary-content">';
+  for (let idx = 0; idx < items.length; idx++) {
+    const section = items[idx];
+    const id = `summary-section-${idx}`;
+    tocHtml += `<li class="toc-item" data-subtopic="${escapeHtml(section.subtopic || '')}" data-section-id="${id}">${escapeHtml(section.subtopic || `${headingPrefix} ${idx + 1}`)}</li>`;
+    contentHtml += `<section id="${id}" class="${sectionClassName}" data-subtopic="${escapeHtml(section.subtopic || '')}"><${headingTag}>${escapeHtml(section.subtopic || `${headingPrefix} ${idx + 1}`)}</${headingTag}><div class="content">${formatMarkdownToHtml(section.content || '')}</div></section>`;
+  }
+  tocHtml += '</ul></div>';
+  contentHtml += '</div>';
+  return `<div class="summary-layout">${tocHtml}${contentHtml}</div>`;
+}
+
 function renderSummary(gen) {
   if (!gen) {
     summaryContainer.innerHTML = '<div class="status-message">Конспект появится после обработки</div>';
@@ -2716,17 +2747,7 @@ function renderSummary(gen) {
     return;
   }
 
-  let tocHtml = '<div class="summary-toc"><h4>📑 Оглавление</h4><ul class="toc-list">';
-  let contentHtml = '<div class="summary-content">';
-  for (let idx = 0; idx < gen.summary.length; idx++) {
-    const section = gen.summary[idx];
-    const id = `section-${idx}`;
-    tocHtml += `<li class="toc-item" data-subtopic="${escapeHtml(section.subtopic || '')}" data-section-id="${id}">${escapeHtml(section.subtopic || '')}</li>`;
-    contentHtml += `<div id="${id}" class="summary-section" data-subtopic="${escapeHtml(section.subtopic || '')}"><h3>${escapeHtml(section.subtopic || '')}</h3><div class="content">${formatMarkdownToHtml(section.content || '')}</div></div>`;
-  }
-  tocHtml += '</ul></div>';
-  contentHtml += '</div>';
-  summaryContainer.innerHTML = `<div class="summary-layout">${tocHtml}${contentHtml}</div>`;
+  summaryContainer.innerHTML = buildSummaryLayoutHtml(gen.summary, { includeToc: true, emptyMessage: 'Конспект отсутствует' });
   summaryContainer.querySelectorAll('.toc-item').forEach((item) => {
     item.addEventListener('click', () => {
       activeSummarySubtopic = item.getAttribute('data-subtopic') || '';

@@ -901,23 +901,41 @@ function renderPractice() {
   renderPracticeSummary();
 }
 
-function renderSummary() {
-  if (!summaryData.length) {
-    summaryContainer.innerHTML = '<div class="status-message">Конспект недоступен</div>';
-    return;
+function buildSummaryLayoutHtml(sections, { includeToc = true, sectionClassName = 'summary-section', headingTag = 'h3', headingPrefix = 'Раздел', tocTitle = 'Оглавление', emptyMessage = 'Конспект недоступен' } = {}) {
+  const items = Array.isArray(sections) ? sections : [];
+  if (!items.length) {
+    return `<div class="status-message">${escapeHtml(emptyMessage)}</div>`;
   }
 
-  let tocHtml = '<div class="summary-toc"><h4>Оглавление</h4><ul class="toc-list">';
+  if (!includeToc) {
+    return `
+      <div class="summary-content">
+        ${items.map((section, idx) => `
+          <section class="${sectionClassName}" data-subtopic="${escapeHtml(section.subtopic || '')}">
+            <${headingTag}>${escapeHtml(section.subtopic || `${headingPrefix} ${idx + 1}`)}</${headingTag}>
+            <div class="content">${formatMarkdownToHtml(section.content || '')}</div>
+          </section>
+        `).join('')}
+      </div>
+    `;
+  }
+
+  let tocHtml = `<div class="summary-toc"><h4>${escapeHtml(tocTitle)}</h4><ul class="toc-list">`;
   let contentHtml = '<div class="summary-content">';
-  for (let idx = 0; idx < summaryData.length; idx++) {
-    const section = summaryData[idx];
+  for (let idx = 0; idx < items.length; idx++) {
+    const section = items[idx];
     const id = `summary-section-${idx}`;
-    tocHtml += `<li class="toc-item" data-subtopic="${escapeHtml(section.subtopic || '')}" data-section-id="${id}">${escapeHtml(section.subtopic || `Раздел ${idx + 1}`)}</li>`;
-    contentHtml += `<section id="${id}" class="summary-section" data-subtopic="${escapeHtml(section.subtopic || '')}"><h3>${escapeHtml(section.subtopic || `Раздел ${idx + 1}`)}</h3><div class="content">${formatMarkdownToHtml(section.content || '')}</div></section>`;
+    tocHtml += `<li class="toc-item" data-subtopic="${escapeHtml(section.subtopic || '')}" data-section-id="${id}">${escapeHtml(section.subtopic || `${headingPrefix} ${idx + 1}`)}</li>`;
+    contentHtml += `<section id="${id}" class="${sectionClassName}" data-subtopic="${escapeHtml(section.subtopic || '')}"><${headingTag}>${escapeHtml(section.subtopic || `${headingPrefix} ${idx + 1}`)}</${headingTag}><div class="content">${formatMarkdownToHtml(section.content || '')}</div></section>`;
   }
   tocHtml += '</ul></div>';
   contentHtml += '</div>';
-  summaryContainer.innerHTML = `<div class="summary-layout">${tocHtml}${contentHtml}</div>`;
+  return `<div class="summary-layout">${tocHtml}${contentHtml}</div>`;
+}
+
+function renderSummary() {
+  summaryContainer.innerHTML = buildSummaryLayoutHtml(summaryData, { includeToc: true, emptyMessage: 'Конспект недоступен' });
+  if (!summaryData.length) return;
   summaryContainer.querySelectorAll('.toc-item').forEach((item) => {
     item.addEventListener('click', () => {
       activeSummarySubtopic = item.getAttribute('data-subtopic') || '';
@@ -987,14 +1005,13 @@ function renderPracticeSummary() {
     return;
   }
 
-  const summaryHtml = summary
-    .map((section, idx) => `
-      <div class="practice-section">
-        <h4>${escapeHtml(section.subtopic || `Раздел ${idx + 1}`)}</h4>
-        <div class="content">${formatMarkdownToHtml(section.content || '')}</div>
-      </div>
-    `)
-    .join('<hr class="practice-divider">');
+  const summaryHtml = buildSummaryLayoutHtml(summary, {
+    includeToc: false,
+    sectionClassName: 'practice-section',
+    headingTag: 'h4',
+    headingPrefix: 'Раздел',
+    emptyMessage: 'Практика пока недоступна'
+  });
 
   if (practiceData.round_submitted) {
     const isFinal = practiceData.practice_completed || !(Array.isArray(practiceData.pending_weak_subtopics) && practiceData.pending_weak_subtopics.length);
