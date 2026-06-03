@@ -23,7 +23,8 @@ from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Request, Uplo
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.sessions import SessionMiddleware
-from backend.ml_service import MLServiceClient, MLServiceError
+from .ml_service import MLServiceClient, MLServiceError
+from .text_repair import repair_latex_value
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(BASE_DIR / ".env")
@@ -193,6 +194,11 @@ def row_to_generation(row: sqlite3.Row) -> dict[str, Any]:
             practice_raw = json.loads(row["practice_json"]) if row["practice_json"] else {}
         except json.JSONDecodeError:
             practice_raw = {}
+    transcript = json.loads(row["transcript_json"])
+    mini_summary = json.loads(row["mini_summary_json"]) if "mini_summary_json" in row.keys() else []
+    summary = json.loads(row["summary_json"])
+    quiz = json.loads(row["quiz_json"])
+    analytics = json.loads(row["analytics_json"])
     return {
         "id": row["id"],
         "user_id": row["user_id"],
@@ -201,12 +207,12 @@ def row_to_generation(row: sqlite3.Row) -> dict[str, Any]:
         "status": row["status"],
         "progress_percent": float(row["progress_percent"]) if "progress_percent" in row.keys() and row["progress_percent"] is not None else 0,
         "created_at": row["created_at"],
-        "transcript": json.loads(row["transcript_json"]),
-        "mini_summary": json.loads(row["mini_summary_json"]) if "mini_summary_json" in row.keys() else [],
-        "summary": json.loads(row["summary_json"]),
-        "quiz": json.loads(row["quiz_json"]),
-        "practice": practice_raw if isinstance(practice_raw, dict) else {},
-        "analytics": json.loads(row["analytics_json"]),
+        "transcript": repair_latex_value(transcript),
+        "mini_summary": repair_latex_value(mini_summary),
+        "summary": repair_latex_value(summary),
+        "quiz": repair_latex_value(quiz),
+        "practice": repair_latex_value(practice_raw if isinstance(practice_raw, dict) else {}),
+        "analytics": repair_latex_value(analytics),
         "error_message": row["error_message"] if "error_message" in row.keys() else "",
     }
 
@@ -286,7 +292,7 @@ def get_cached_transcript(content_hash: str) -> Optional[list[dict[str, Any]]]:
         transcript = json.loads(row["transcript_json"])
     except json.JSONDecodeError:
         return None
-    return transcript if isinstance(transcript, list) else None
+    return repair_latex_value(transcript) if isinstance(transcript, list) else None
 
 
 def store_cached_transcript(content_hash: str, transcript: list[dict[str, Any]]) -> None:
@@ -299,7 +305,7 @@ def store_cached_transcript(content_hash: str, transcript: list[dict[str, Any]])
           transcript_json = excluded.transcript_json,
           created_at = excluded.created_at
         """,
-        (content_hash, json.dumps(transcript, ensure_ascii=False), now_iso()),
+        (content_hash, json.dumps(repair_latex_value(transcript), ensure_ascii=False), now_iso()),
     )
     conn.commit()
     conn.close()
@@ -914,6 +920,7 @@ def update_generation(generation_id: str, patch: dict[str, Any], broadcast_event
         current_practice = normalize_practice_state(current.get("practice", {}))
         if practice_is_active(current_practice):
             merged["practice"] = invalidate_practice_state("Практика устарела после изменения конспекта или теста.")
+    merged = repair_latex_value(merged)
     conn = db_conn()
     conn.execute(
         """
@@ -2778,7 +2785,7 @@ def analytics_from_attempts(generation_id: str, quiz: list[dict[str, Any]], atte
     stats = {subtopic: {"correct": 0, "total": 0} for subtopic in subtopics}
     for attempt in attempts:
         try:
-            results = json.loads(attempt["results_json"])
+            results = repair_latex_value(json.loads(attempt["results_json"]))
         except (TypeError, json.JSONDecodeError):
             results = []
         for item in results if isinstance(results, list) else []:
@@ -2938,9 +2945,9 @@ def load_student_attempt(generation_id: str, user_id: str) -> Optional[dict[str,
     if not attempt_row:
         return None
     return {
-        "answers": json.loads(attempt_row["answers_json"]) if attempt_row["answers_json"] else [],
-        "results": json.loads(attempt_row["results_json"]) if attempt_row["results_json"] else [],
-        "mastery": json.loads(attempt_row["mastery_json"]) if attempt_row["mastery_json"] else [],
+        "answers": repair_latex_value(json.loads(attempt_row["answers_json"])) if attempt_row["answers_json"] else [],
+        "results": repair_latex_value(json.loads(attempt_row["results_json"])) if attempt_row["results_json"] else [],
+        "mastery": repair_latex_value(json.loads(attempt_row["mastery_json"])) if attempt_row["mastery_json"] else [],
         "recommendation": attempt_row["recommendation"] or "",
         "subtopic_to_revise": attempt_row["subtopic_to_revise"] or "",
         "created_at": attempt_row["created_at"],

@@ -6,6 +6,8 @@ from typing import Any, Optional
 
 import httpx
 
+from .text_repair import repair_latex_text, repair_latex_value
+
 
 class MLServiceError(Exception):
     def __init__(self, message: str, user_message: str) -> None:
@@ -14,8 +16,8 @@ class MLServiceError(Exception):
 
 
 def _fix_json_escapes(text: str) -> str:
-    """Restore JSON-escaped \\f and \\r that Python's json parser converted to control chars."""
-    return text.replace("\x0c", "\\f").replace("\x0d", "\\r")
+    """Restore LaTeX escapes that Python's JSON parser turned into control characters."""
+    return repair_latex_text(text)
 
 
 _QUESTION_TYPE_TO_CANONICAL = {
@@ -111,8 +113,8 @@ class MLServiceClient:
         if isinstance(task, dict):
             result = task.get("result")
             if isinstance(result, dict):
-                return result
-            return task
+                return repair_latex_value(result)
+            return repair_latex_value(task)
         return {}
 
     @staticmethod

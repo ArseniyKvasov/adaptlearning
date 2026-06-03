@@ -33,6 +33,44 @@ function escapeHtml(str) {
   return String(str ?? '').replace(/[&<>"']/g, (m) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[m]));
 }
 
+const MATH_SEGMENT_RE = /\$\$[\s\S]*?\$\$|\$[^$\n]+?\$|\\\([\s\S]*?\\\)|\\\[[\s\S]*?\\\]/g;
+const LATEX_CONTROL_REPAIR_MAP = {
+  '\b': '\\b',
+  '\t': '\\t',
+  '\n': '\\n',
+  '\v': '\\v',
+  '\f': '\\f',
+  '\r': '\\r'
+};
+
+function repairLatexMathSegment(segment) {
+  return String(segment || '').replace(/[\b\t\n\v\f\r]/g, (char) => LATEX_CONTROL_REPAIR_MAP[char] || char);
+}
+
+function normalizeTextWithMathSegments(text) {
+  const raw = String(text ?? '');
+  if (!raw) return '';
+
+  let result = '';
+  let lastIndex = 0;
+  const mathRegex = new RegExp(MATH_SEGMENT_RE.source, 'g');
+
+  for (const match of raw.matchAll(mathRegex)) {
+    const index = match.index ?? 0;
+    if (index > lastIndex) {
+      result += raw.slice(lastIndex, index).replace(/\\n/g, '\n').replace(/\u2014/g, '-');
+    }
+    result += repairLatexMathSegment(match[0]);
+    lastIndex = index + match[0].length;
+  }
+
+  if (lastIndex < raw.length) {
+    result += raw.slice(lastIndex).replace(/\\n/g, '\n').replace(/\u2014/g, '-');
+  }
+
+  return result;
+}
+
 function protectMathSegments(text) {
   const mathParts = [];
   const protectedText = (text || '').replace(/\$\$[\s\S]*?\$\$|\$[^$\n]+?\$|\\\([\s\S]*?\\\)|\\\[[\s\S]*?\\\]/g, (match) => {
@@ -48,9 +86,7 @@ function restoreMathSegments(text, mathParts) {
 }
 
 function normalizeTextBreaks(text) {
-  return (text || '')
-    .replace(/\\n/g, '\n')
-    .replace(/\u2014/g, '-');
+  return normalizeTextWithMathSegments(text);
 }
 
 function removePunctuationAfterBlockMath(text) {
@@ -61,9 +97,7 @@ function removePunctuationAfterBlockMath(text) {
 }
 
 function normalizeQuizText(text) {
-  return (text || '')
-    .replace(/\\n/g, '\n')
-    .replace(/\u2014/g, '-');
+  return normalizeTextWithMathSegments(text);
 }
 
 function normalizePracticeState(raw) {
@@ -338,7 +372,7 @@ function markdownInlineToHtmlQuiz(text) {
 }
 
 function formatMarkdownToHtml(text) {
-  const source = escapeHtml(normalizeTextBreaks(removePunctuationAfterBlockMath(text))).replace(/#/g, '');
+  const source = escapeHtml(normalizeTextBreaks(removePunctuationAfterBlockMath(text)));
   const protectedMath = protectMathSegments(source);
   let html = protectedMath.text;
 
