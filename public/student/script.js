@@ -100,7 +100,10 @@ function prepareSummaryTextForDisplay(text) {
   const normalized = normalizeTextBreaks(removePunctuationAfterBlockMath(text));
   const lines = normalized.split(/\r?\n/);
   const trimmedBackslashes = lines.map((line) => (line.endsWith('\\') ? line.slice(0, -1) : line));
-  const removedDividerLines = trimmedBackslashes.map((line) => (line.trim() === '---' ? '' : line));
+  const removedDividerLines = trimmedBackslashes.map((line) => {
+    if (line.trim() === '---') return '';
+    return line.replace(/^\s{0,3}#{1,6}(?=\s|$)\s?/, '');
+  });
   return removedDividerLines.join('\n');
 }
 
