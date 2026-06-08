@@ -176,12 +176,14 @@ class MLServiceClient:
         try:
             data = resp.json()
         except ValueError as exc:
+            print(f"DEBUG: ML POST {path} returned invalid JSON: {resp.text[:1000]}")
             raise MLServiceError(
                 f"ML returned invalid JSON ({resp.status_code}): {resp.text[:500]}",
                 self._http_user_message(resp.status_code),
             ) from exc
 
         if resp.status_code >= 400:
+            print(f"DEBUG: ML POST {path} failed: status={resp.status_code}, payload={self._compact_preview(payload)}, response={data}")
             if resp.status_code == 429:
                 message = self._http_user_message(429)
             else:
@@ -223,12 +225,14 @@ class MLServiceClient:
         try:
             payload = resp.json()
         except ValueError as exc:
+            print(f"DEBUG: ML POST (multipart) {path} returned invalid JSON: {resp.text[:1000]}")
             raise MLServiceError(
                 f"ML returned invalid JSON ({resp.status_code}): {resp.text[:500]}",
                 self._http_user_message(resp.status_code),
             ) from exc
 
         if resp.status_code >= 400:
+            print(f"DEBUG: ML POST (multipart) {path} failed: status={resp.status_code}, data={data}, response={payload}")
             if resp.status_code == 429:
                 message = self._http_user_message(429)
             else:
@@ -276,12 +280,14 @@ class MLServiceClient:
         try:
             data = resp.json()
         except ValueError as exc:
+            print(f"DEBUG: ML GET task {job_id} returned invalid JSON: {resp.text[:1000]}")
             raise MLServiceError(
                 f"ML task returned invalid JSON ({resp.status_code}): {resp.text[:500]}",
                 self._http_user_message(resp.status_code),
             ) from exc
 
         if resp.status_code >= 400:
+            print(f"DEBUG: ML GET task {job_id} failed: status={resp.status_code}, response={data}")
             if resp.status_code == 429:
                 message = self._http_user_message(429)
             else:
@@ -317,6 +323,7 @@ class MLServiceClient:
             current = await self._get_task(job_id, timeout_s=min(30, max(1, int(remaining))))
 
         if str(current.get("status") or "").strip().casefold() == "failed":
+            print(f"DEBUG: ML task {job_id} failed: {current}")
             error_message = self._task_error_message(current) or "Не удалось выполнить задачу в ML-сервисе."
             raise MLServiceError(
                 f"ML task failed ({task_type}, {job_id}): {current}",
@@ -334,6 +341,7 @@ class MLServiceClient:
         start_ms: int,
         end_ms: int,
     ) -> list[dict[str, Any]]:
+        print(f"DEBUG: transcribe_chunk: file_name={file_name}, mime_type={mime_type}, size={len(audio_bytes)}, chunk_id={chunk_id}, start_ms={start_ms}, end_ms={end_ms}")
         audio_preview = f"{len(audio_bytes)} bytes"
         task: dict[str, Any] = {}
         if os.getenv("ML_DEBUG_TRANSCRIBE_REQUESTS", "0") == "1":

@@ -3911,8 +3911,10 @@ async def api_generations(request: Request):
 @app.post("/api/generations/upload")
 async def api_generations_upload(request: Request, background_tasks: BackgroundTasks, file: UploadFile = File(...)):
     user_id = ensure_guest_user(request)
+    print(f"DEBUG: api_generations_upload: filename={file.filename}, content_type={file.content_type}")
     try:
         file_bytes = await file.read()
+        print(f"DEBUG: api_generations_upload: read {len(file_bytes)} bytes")
         if not file_bytes:
             raise HTTPException(status_code=400, detail="Empty file")
         if len(file_bytes) > 200 * 1024 * 1024:
